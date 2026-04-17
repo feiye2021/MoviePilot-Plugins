@@ -4,7 +4,7 @@
         "description": "监控视频短剧创建，刮削，支持目的目录为网盘，刮削完成后通知CMS增量更新。(基于thsrite、Seed680、imaliang三位大佬原版魔改)",
         "labels": "短剧",
         "version": "1.7.3",
-        "icon": "https://github.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png",
+        "icon": "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png",
         "author": "thsrite,Seed680,imaliang,feiye",
         "level": 1,
         "history": {

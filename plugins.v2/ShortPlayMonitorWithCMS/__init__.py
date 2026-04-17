@@ -66,7 +66,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件描述
     plugin_desc = "监控视频短剧创建、刮削，支持目的目录为网盘，整理完成后自动通知CMS进行增量同步（strm生成）。"
     # 插件图标
-    plugin_icon = "https://github.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png"
+    plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
     plugin_version = "1.0.0"
     # 插件作者
