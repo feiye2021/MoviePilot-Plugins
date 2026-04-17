@@ -1,1 +1,0 @@
-from . import ShortPlayMonitorWithCMS as Plugin
