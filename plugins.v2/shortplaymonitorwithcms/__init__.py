@@ -68,7 +68,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -84,7 +84,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     _enabled = False
     _monitor_confs = None
     _onlyonce = False
-    _image = False
+    _image = True
     _exclude_keywords = ""
     _transfer_type = "link"
     _observer = []
@@ -241,10 +241,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                 self._scheduler.print_jobs()
                 self._scheduler.start()
 
-        if self._image:
-            self._image = False
-            self.__update_config()
-            self.__handle_image()
+        # _image 为持久开关，不在初始化时触发裁剪
+        # 封面裁剪在每次文件整理成功后由 __handle_file 内部调用
 
     def sync_all(self):
         """
@@ -662,74 +660,85 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             else:
                                 logger.debug((f"文件 {Path(target_path.parent / 'tvshow.nfo')} 整理失败:{errmsg}"))
 
-                    logger.debug(f"文件 {event_path} 生成缩略图开始")
-                    if store_conf == "local":
-                        logger.debug(f"tvshow.nfo exists: {(target_path.parent / 'poster.jpg').exists()}")
-                    else:
-                        logger.debug(
-                            f"tvshow.nfo exists: "
-                            f"{self.filemanager.get_file_item(store_conf, (target_path.parent / 'poster.jpg'))}")
+                    # 封面裁剪（持久开关 _image 控制，默认开启）
+                    if self._image:
+                        logger.debug(f"文件 {event_path} 生成缩略图开始")
+                        if store_conf == "local":
+                            logger.debug(f"poster exists: {(target_path.parent / 'poster.jpg').exists()}")
+                        else:
+                            logger.debug(
+                                f"poster exists: "
+                                f"{self.filemanager.get_file_item(store_conf, (target_path.parent / 'poster.jpg'))}")
 
-                    # 生成缩略图
-                    if (store_conf == "local" and not (target_path.parent / "poster.jpg").exists()):
-                        thumb_path = self.gen_file_thumb(title=title,
-                                                         rename_conf=rename_conf,
-                                                         file_path=target_path)
-                        if thumb_path and Path(thumb_path).exists():
-                            self.__save_poster(input_path=thumb_path,
+                        # 本地存储：生成缩略图并裁剪为封面
+                        if (store_conf == "local" and not (target_path.parent / "poster.jpg").exists()):
+                            thumb_path = self.gen_file_thumb(title=title,
+                                                             rename_conf=rename_conf,
+                                                             file_path=target_path)
+                            if thumb_path and Path(thumb_path).exists():
+                                self.__save_poster(input_path=thumb_path,
+                                                   poster_path=target_path.parent / "poster.jpg",
+                                                   cover_conf=cover_conf)
+                                if (target_path.parent / "poster.jpg").exists():
+                                    logger.info(f"{target_path.parent / 'poster.jpg'} 缩略图已生成")
+                                thumb_path.unlink()
+                            else:
+                                thumb_files = SystemUtils.list_files(directory=target_path.parent,
+                                                                     extensions=[".jpg"])
+                                if thumb_files:
+                                    for thumb in thumb_files:
+                                        self.__save_poster(input_path=thumb,
+                                                           poster_path=target_path.parent / "poster.jpg",
+                                                           cover_conf=cover_conf)
+                                        break
+                                    for thumb in thumb_files:
+                                        Path(thumb).unlink()
+                        elif (store_conf == "local" and (target_path.parent / "poster.jpg").exists()):
+                            # poster 已存在时，直接对现有 poster 按 cover_conf 比例重新裁剪
+                            self.__save_poster(input_path=target_path.parent / "poster.jpg",
                                                poster_path=target_path.parent / "poster.jpg",
                                                cover_conf=cover_conf)
-                            if (target_path.parent / "poster.jpg").exists():
-                                logger.info(f"{target_path.parent / 'poster.jpg'} 缩略图已生成")
-                            thumb_path.unlink()
-                        else:
-                            thumb_files = SystemUtils.list_files(directory=target_path.parent,
-                                                                 extensions=[".jpg"])
-                            if thumb_files:
-                                for thumb in thumb_files:
-                                    self.__save_poster(input_path=thumb,
-                                                       poster_path=target_path.parent / "poster.jpg",
-                                                       cover_conf=cover_conf)
-                                    break
-                                for thumb in thumb_files:
-                                    Path(thumb).unlink()
+                            logger.info(f"{target_path.parent / 'poster.jpg'} 封面已重新裁剪")
 
-                    if (store_conf != "local"
-                            and None == self.filemanager.get_file_item(store_conf,
-                                                                       (target_path.parent / "poster.jpg"))):
-                        thumb_path = self.gen_file_thumb(title=title,
-                                                         rename_conf=rename_conf,
-                                                         file_path=Path(event_path),
-                                                         to_thumb_path="/tmp/shortplaymonitormod" /
-                                                                       target_path.parent.relative_to(
-                                                                           Path("/")))
-                        if thumb_path and Path(thumb_path).exists():
-                            self.__save_poster(input_path=thumb_path,
-                                               poster_path="/tmp/shortplaymonitormod" /
-                                                           target_path.parent.relative_to(
-                                                               Path("/")) / "poster.jpg",
-                                               cover_conf=cover_conf)
-                            if ("/tmp/shortplaymonitormod" / target_path.parent.relative_to(
-                                    Path("/")) / "poster.jpg").exists():
-                                file_item = FileItem()
-                                file_item.storage = "local"
-                                file_item.path = str(
-                                    "/tmp/shortplaymonitormod" / target_path.parent.relative_to(
-                                        Path("/")) / "poster.jpg")
-                                source_oper = self.filemanager._FileManagerModule__get_storage_oper("local")
-                                target_oper = self.filemanager._FileManagerModule__get_storage_oper(store_conf)
-                                if not source_oper or not target_oper:
-                                    return None, f"不支持的存储类型：{store_conf}"
-                                new_item, errmsg = TransHandler._TransHandler__transfer_command(
-                                    fileitem=file_item,
-                                    target_storage=store_conf,
-                                    target_file=Path(target_path.parent / "poster.jpg"),
-                                    transfer_type=self._transfer_type, source_oper=source_oper,
-                                    target_oper=target_oper)
-                                if new_item:
-                                    logger.debug(f"{target_path.parent / 'poster.jpg'} 缩略图已整理")
-                                logger.info(f"{target_path.parent / 'poster.jpg'} 缩略图已生成")
-                                thumb_path.unlink()
+                        # 网盘存储：本地生成后上传
+                        if (store_conf != "local"
+                                and None == self.filemanager.get_file_item(store_conf,
+                                                                           (target_path.parent / "poster.jpg"))):
+                            thumb_path = self.gen_file_thumb(title=title,
+                                                             rename_conf=rename_conf,
+                                                             file_path=Path(event_path),
+                                                             to_thumb_path="/tmp/shortplaymonitormod" /
+                                                                           target_path.parent.relative_to(
+                                                                               Path("/")))
+                            if thumb_path and Path(thumb_path).exists():
+                                self.__save_poster(input_path=thumb_path,
+                                                   poster_path="/tmp/shortplaymonitormod" /
+                                                               target_path.parent.relative_to(
+                                                                   Path("/")) / "poster.jpg",
+                                                   cover_conf=cover_conf)
+                                if ("/tmp/shortplaymonitormod" / target_path.parent.relative_to(
+                                        Path("/")) / "poster.jpg").exists():
+                                    file_item = FileItem()
+                                    file_item.storage = "local"
+                                    file_item.path = str(
+                                        "/tmp/shortplaymonitormod" / target_path.parent.relative_to(
+                                            Path("/")) / "poster.jpg")
+                                    source_oper = self.filemanager._FileManagerModule__get_storage_oper("local")
+                                    target_oper = self.filemanager._FileManagerModule__get_storage_oper(store_conf)
+                                    if not source_oper or not target_oper:
+                                        return None, f"不支持的存储类型：{store_conf}"
+                                    new_item, errmsg = TransHandler._TransHandler__transfer_command(
+                                        fileitem=file_item,
+                                        target_storage=store_conf,
+                                        target_file=Path(target_path.parent / "poster.jpg"),
+                                        transfer_type=self._transfer_type, source_oper=source_oper,
+                                        target_oper=target_oper)
+                                    if new_item:
+                                        logger.debug(f"{target_path.parent / 'poster.jpg'} 缩略图已整理")
+                                    logger.info(f"{target_path.parent / 'poster.jpg'} 缩略图已生成")
+                                    thumb_path.unlink()
+                    else:
+                        logger.debug(f"封面裁剪开关已关闭，跳过缩略图生成")
                 else:
                     logger.error(f"文件 {event_path} 硬链接失败，错误码：{retcode}")
 
@@ -1410,13 +1419,13 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         ], {
             "enabled": False,
             "onlyonce": False,
-            "image": False,
+            "image": True,
             "notify": False,
             "interval": 10,
             "monitor_confs": "",
             "exclude_keywords": "",
             "transfer_type": "link",
-            "site_fallback": False,
+            "site_fallback": True,
             "cms_enabled": False,
             "cms_notify_type": "lift_sync",
             "cms_api_token": "cloud_media_sync",
