@@ -60,7 +60,7 @@ class FileMonitorHandler(FileSystemEventHandler):
         self.file_change.event_handler(event=event, source_dir=self._watch_path, event_path=event.dest_path)
 
 
-class ShortPlayMonitorWithCMS(_PluginBase):
+class ShortPlayMonitorWithCMS(_PluginBase)
     # 插件名称
     plugin_name = "短剧刮削+CMS通知"
     # 插件描述
@@ -97,6 +97,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     _notify = False
     _medias = {}
     filemanager = None
+
+    # ===== 刮削降级私有属性 =====
+    _site_fallback = False   # TMDB失败时是否降级到站点（AGSVPT/麒麟）刮削
 
     # ===== CMS通知私有属性 =====
     _cms_enabled = False
@@ -135,6 +138,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             self._cms_notify_type = config.get("cms_notify_type")
             self._cms_domain = config.get("cms_domain")
             self._cms_api_token = config.get("cms_api_token")
+            self._site_fallback = config.get("site_fallback") or False
 
         # 停止现有任务
         self.stop_service()
@@ -318,6 +322,156 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                            event_path=event_path,
                            source_dir=source_dir)
 
+    @staticmethod
+    def __make_folder_name(display_title: str, year: str, tmdb_id) -> str:
+        """根据已知字段拼装文件夹名，遵循统一输出规则。"""
+        if tmdb_id and year:
+            return f"{display_title} ({year}) {{tmdb={tmdb_id}}}"
+        elif tmdb_id:
+            return f"{display_title} {{tmdb={tmdb_id}}}"
+        elif year:
+            return f"{display_title} ({year})"
+        else:
+            return display_title
+
+    def __resolve_folder_name(self, title: str) -> str:
+        """
+        文件夹名解析主逻辑（TMDB 优先，站点降级）：
+
+        1. 先向 TMDB 搜索（电视剧 → 电影）。
+           - 找到 → 按输出规则返回 "标题 (年份) {tmdb=XXXXX}"。
+        2. TMDB 未命中，且开启了站点降级（_site_fallback=True）：
+           - 检测 MP 是否已关联 AGSVPT（agsvpt.com）或 麒麟（ilolicon.com）。
+           - 已关联的站点按顺序搜索种子标题，取第一条种子标题作为 display_title，
+             年份从种子标题里用正则提取（格式常见如 2024），无 tmdb_id。
+           - 输出规则同上，但 tmdb_id 为 None，只有标题+年份（能提取时）。
+        3. 以上均失败 → 直接返回原始 title，整理流程不中断。
+        """
+        # ── Step 1: TMDB 查询 ───────────────────────────────────────────────
+        try:
+            logger.info(f"[文件夹名解析] TMDB 查询：{title}")
+            best = None
+            tmdb_type = None
+
+            try:
+                tv_results = self.tmdbchain.search_tv(title) or []
+                if tv_results:
+                    best = tv_results[0]
+                    tmdb_type = "电视剧"
+            except Exception as e:
+                logger.debug(f"TMDB 电视剧搜索异常：{e}")
+
+            if not best:
+                try:
+                    movie_results = self.tmdbchain.search_movie(title) or []
+                    if movie_results:
+                        best = movie_results[0]
+                        tmdb_type = "电影"
+                except Exception as e:
+                    logger.debug(f"TMDB 电影搜索异常：{e}")
+
+            if best:
+                tmdb_id = getattr(best, "tmdb_id", None) or getattr(best, "id", None)
+                year_raw = (
+                    getattr(best, "first_air_date", None)
+                    or getattr(best, "release_date", None)
+                    or ""
+                )
+                year = str(year_raw)[:4] if year_raw and len(str(year_raw)) >= 4 else ""
+                display_title = (
+                    getattr(best, "cn_name", None)
+                    or getattr(best, "title", None)
+                    or getattr(best, "name", None)
+                    or title
+                )
+                folder = self.__make_folder_name(display_title, year, tmdb_id)
+                logger.info(f"[文件夹名解析] TMDB {tmdb_type} 命中：[{title}] → [{folder}]")
+                return folder
+
+        except Exception as e:
+            logger.error(f"[文件夹名解析] TMDB 查询异常：{title}，{e}", exc_info=True)
+
+        logger.warning(f"[文件夹名解析] TMDB 未命中：{title}")
+
+        # ── Step 2: 站点降级（可选） ────────────────────────────────────────
+        if self._site_fallback:
+            logger.info(f"[文件夹名解析] 尝试站点降级刮削：{title}")
+            site_title = self.__resolve_title_from_site(title)
+            if site_title:
+                # 从种子标题里尝试提取年份（常见格式：空格或括号包裹的4位年份）
+                year_match = re.search(r"[（(【\[\s]((?:19|20)\d{2})[）)】\]\s]", site_title)
+                year = year_match.group(1) if year_match else ""
+                # display_title 直接用站点种子标题（已是可读名称）
+                folder = self.__make_folder_name(site_title, year, None)
+                logger.info(f"[文件夹名解析] 站点降级命中：[{title}] → [{folder}]")
+                return folder
+            else:
+                logger.warning(f"[文件夹名解析] 站点降级未命中：{title}")
+
+        # ── Step 3: 全部失败，返回原始 title ────────────────────────────────
+        logger.warning(f"[文件夹名解析] 降级完毕仍未找到，使用原始标题：{title}")
+        return title
+
+    def __resolve_title_from_site(self, title: str) -> Optional[str]:
+        """
+        从 AGSVPT 或 麒麟(ilolicon) 搜索种子，返回第一条种子的标题字符串。
+        仅在 MP 中已配置对应站点 Cookie 时才会发起请求。
+        返回 None 表示未找到或站点未配置。
+        """
+        site_configs = [
+            {
+                "domain": "agsvpt.com",
+                "url_tpl": (
+                    "https://www.agsvpt.com/torrents.php"
+                    "?search_mode=0&search_area=0&page=0&notnewword=1&cat=419&search={title}"
+                ),
+                "title_xpath": "//a[contains(@class,'torrent-name')]//text()",
+            },
+            {
+                "domain": "ilolicon.com",
+                "url_tpl": (
+                    "https://share.ilolicon.com/torrents.php"
+                    "?search_mode=0&search_area=0&page=0&notnewword=1&cat=402&search={title}"
+                ),
+                "title_xpath": "//a[contains(@class,'torrent-name')]//text()",
+            },
+        ]
+
+        for cfg in site_configs:
+            try:
+                site = SiteOper().get_by_domain(cfg["domain"])
+                index = SitesHelper().get_indexer(cfg["domain"])
+                if not site:
+                    logger.debug(f"[站点降级] {cfg['domain']} 未配置，跳过")
+                    continue
+
+                req_url = cfg["url_tpl"].format(title=title)
+                logger.info(f"[站点降级] 请求 {cfg['domain']}：{req_url}")
+                page_source = self.__get_page_source(url=req_url, site=site)
+                if not page_source:
+                    continue
+
+                _spider = SiteSpider(indexer=index, page=1)
+                torrents = _spider.parse(page_source)
+                if not torrents:
+                    logger.warning(f"[站点降级] {cfg['domain']} 未搜索到结果")
+                    continue
+
+                # torrents[0] 是字典，取 title 字段
+                torrent_title = (
+                    torrents[0].get("title")
+                    or torrents[0].get("name")
+                    or ""
+                )
+                if torrent_title:
+                    logger.info(f"[站点降级] {cfg['domain']} 命中种子标题：{torrent_title}")
+                    return torrent_title.strip()
+
+            except Exception as e:
+                logger.error(f"[站点降级] {cfg['domain']} 查询异常：{e}", exc_info=True)
+
+        return None
+
     def __handle_file(self, is_directory: bool, event_path: str, source_dir: str):
         """
         同步一个文件
@@ -358,9 +512,12 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                 last = target.replace(str(parent), "").replace("/", "")
                 logger.debug(f"last:{last}")
                 if rename_conf:
-                    # 自定义识别次
-                    title, _ = WordsMatcher().prepare(str(parent.name))
-                    logger.debug(f"title:{title}")
+                    # 自定义识别词
+                    raw_title, _ = WordsMatcher().prepare(str(parent.name))
+                    logger.debug(f"raw_title:{raw_title}")
+                    # TMDB 查询，生成标准文件夹名
+                    title = self.__resolve_folder_name(raw_title)
+                    logger.debug(f"title (with tmdb):{title}")
                     target_path = Path(dest_dir).joinpath(title).joinpath(last)
                     logger.debug(f"target_path:{target_path}")
                 else:
@@ -375,10 +532,13 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                     last = target.replace(str(parent), "").replace("/", "")
                     logger.debug(f"last:{last}")
                     if parent.parent == parent:
-                        title = last.split(".")[0]
+                        raw_title = last.split(".")[0]
                     else:
-                        title = parent.name.split(".")[0]
-                    logger.debug(f"title:{title}")
+                        raw_title = parent.name.split(".")[0]
+                    logger.debug(f"raw_title:{raw_title}")
+                    # TMDB 查询，生成标准文件夹名
+                    title = self.__resolve_folder_name(raw_title)
+                    logger.debug(f"title (with tmdb):{title}")
                     target_path = Path(dest_dir).joinpath(title).joinpath(last)
                     logger.debug(f"target_path:{target_path}")
                 else:
@@ -919,6 +1079,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "cms_notify_type": self._cms_notify_type,
             "cms_domain": self._cms_domain,
             "cms_api_token": self._cms_api_token,
+            "site_fallback": self._site_fallback,
         })
 
     def get_state(self) -> bool:
@@ -945,7 +1106,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 2},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
@@ -958,7 +1119,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 2},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
@@ -971,7 +1132,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 2},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
@@ -984,13 +1145,26 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 2},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
                                         'props': {
                                             'model': 'notify',
                                             'label': '发送通知',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'site_fallback',
+                                            'label': 'TMDB失败时站点降级（AGSVPT/麒麟）',
                                         }
                                     }
                                 ]
@@ -1242,6 +1416,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "monitor_confs": "",
             "exclude_keywords": "",
             "transfer_type": "link",
+            "site_fallback": False,
             "cms_enabled": False,
             "cms_notify_type": "lift_sync",
             "cms_api_token": "cloud_media_sync",
