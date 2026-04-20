@@ -60,13 +60,13 @@ class FileMonitorHandler(FileSystemEventHandler):
         self.file_change.event_handler(event=event, source_dir=self._watch_path, event_path=event.dest_path)
 
 
-class ShortPlayMonitorWithCMS(_PluginBase)
+class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件名称
     plugin_name = "短剧刮削+CMS通知"
     # 插件描述
     plugin_desc = "监控视频短剧创建、刮削，支持目的目录为网盘，整理完成后自动通知CMS进行增量同步（strm生成）。"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
+    plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png"
     # 插件版本
     plugin_version = "1.0.1"
     # 插件作者
