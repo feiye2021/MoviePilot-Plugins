@@ -68,7 +68,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -99,15 +99,24 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     filemanager = None
 
     # ===== 刮削降级私有属性 =====
-    _site_fallback = False   # TMDB失败时是否降级到站点（AGSVPT/麒麟）刮削
+    _site_fallback = False        # TMDB失败时是否降级到站点（AGSVPT/麒麟）刮削
+    _agsvpt_dual_cookie = False   # 是否启用 AGSVPT 双域名自定义 Cookie
+    _agsvpt_cookie_pt = ""        # pt.agsvpt.cn 的 Cookie
+    _agsvpt_cookie_www = ""       # www.agsvpt.com 的 Cookie
 
     # ===== CMS通知私有属性 =====
     _cms_enabled = False
     _cms_notify_type = None
     _cms_domain = None
     _cms_api_token = None
-    _last_event_time = 0
-    _wait_notify_count = 0
+    # CMS通知队列：key=剧集title，value={"count": int, "last_time": float}
+    # 每个剧集单独计时，全部上传完成静默60秒后才触发CMS通知
+    _pending_notify: Dict[str, Dict] = {}
+
+    # 网盘批量上传队列：key=剧集title，value={"files": [...], "last_time": float, "store_conf": str}
+    # files 每项为 {"event_path": str, "target_path": Path}
+    # 监控目录静默60秒后统一批量上传，避免一集一集触发115接口
+    _upload_queue: Dict[str, Dict] = {}
 
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
@@ -139,6 +148,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             self._cms_domain = config.get("cms_domain")
             self._cms_api_token = config.get("cms_api_token")
             self._site_fallback = config.get("site_fallback") or False
+            self._agsvpt_dual_cookie = config.get("agsvpt_dual_cookie") or False
+            self._agsvpt_cookie_pt = config.get("agsvpt_cookie_pt") or ""
+            self._agsvpt_cookie_www = config.get("agsvpt_cookie_www") or ""
 
         # 停止现有任务
         self.stop_service()
@@ -149,6 +161,15 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             if self._notify:
                 # 追加入库消息统一发送服务
                 self._scheduler.add_job(self.send_msg, trigger='interval', seconds=15)
+
+            # 网盘批量上传定时任务（每30秒检查一次，静默60秒后批量上传）
+            self._scheduler.add_job(
+                self.__batch_upload,
+                trigger='interval',
+                seconds=30,
+                id="batch_upload",
+                name="网盘批量上传"
+            )
 
             # CMS通知定时任务（每分钟检查一次）
             if self._cms_enabled:
@@ -339,7 +360,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         1. 先向 TMDB 搜索（电视剧 → 电影）。
            - 找到 → 按输出规则返回 "标题 (年份) {tmdb=XXXXX}"。
         2. TMDB 未命中，且开启了站点降级（_site_fallback=True）：
-           - 检测 MP 是否已关联 AGSVPT（agsvpt.com）或 麒麟（ilolicon.com）。
+           - 检测 MP 是否已关联 AGSVPT（pt.agsvpt.cn / www.agsvpt.com）或 麒麟（ilolicon.com）。
            - 已关联的站点按顺序搜索种子标题，取第一条种子标题作为 display_title，
              年份从种子标题里用正则提取（格式常见如 2024），无 tmdb_id。
            - 输出规则同上，但 tmdb_id 为 None，只有标题+年份（能提取时）。
@@ -413,61 +434,61 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     def __resolve_title_from_site(self, title: str) -> Optional[str]:
         """
         从 AGSVPT 或 麒麟(ilolicon) 搜索种子，返回第一条种子的标题字符串。
-        仅在 MP 中已配置对应站点 Cookie 时才会发起请求。
-        返回 None 表示未找到或站点未配置。
+        双Cookie模式：每个 Cookie 对应各自域名的 URL 独立请求。
+        单站点模式：仅查询 www.agsvpt.com，失败即失败。
+        返回 None 表示未找到或站点均未配置。
         """
-        site_configs = [
-            {
-                "domain": "agsvpt.com",
-                "url_tpl": (
-                    "https://www.agsvpt.com/torrents.php"
-                    "?search_mode=0&search_area=0&page=0&notnewword=1&cat=419&search={title}"
-                ),
-                "title_xpath": "//a[contains(@class,'torrent-name')]//text()",
-            },
-            {
-                "domain": "ilolicon.com",
-                "url_tpl": (
-                    "https://share.ilolicon.com/torrents.php"
-                    "?search_mode=0&search_area=0&page=0&notnewword=1&cat=402&search={title}"
-                ),
-                "title_xpath": "//a[contains(@class,'torrent-name')]//text()",
-            },
-        ]
-
-        for cfg in site_configs:
+        # ── AGSVPT ──
+        agsv_entries = self.__get_agsvpt_site()
+        for site, index, label in agsv_entries:
+            # 双Cookie模式：每个entry只查自己对应的URL
+            # 单站点模式：只有www条目，只查www URL
+            url_map = {
+                "pt.agsvpt.cn":  "https://pt.agsvpt.cn/torrents.php",
+                "www.agsvpt.com": "https://www.agsvpt.com/torrents.php",
+            }
+            base_url = url_map.get(label, "https://www.agsvpt.com/torrents.php")
             try:
-                site = SiteOper().get_by_domain(cfg["domain"])
-                index = SitesHelper().get_indexer(cfg["domain"])
-                if not site:
-                    logger.debug(f"[站点降级] {cfg['domain']} 未配置，跳过")
-                    continue
-
-                req_url = cfg["url_tpl"].format(title=title)
-                logger.info(f"[站点降级] 请求 {cfg['domain']}：{req_url}")
+                req_url = self._AGSVPT_SEARCH_TPL.format(base=base_url, title=title)
+                logger.info(f"[站点降级] 请求 AGSVPT {label}：{title}")
                 page_source = self.__get_page_source(url=req_url, site=site)
                 if not page_source:
                     continue
-
                 _spider = SiteSpider(indexer=index, page=1)
                 torrents = _spider.parse(page_source)
                 if not torrents:
-                    logger.warning(f"[站点降级] {cfg['domain']} 未搜索到结果")
+                    logger.debug(f"[站点降级] AGSVPT {label} 无结果")
                     continue
-
-                # torrents[0] 是字典，取 title 字段
-                torrent_title = (
-                    torrents[0].get("title")
-                    or torrents[0].get("name")
-                    or ""
-                )
+                torrent_title = torrents[0].get("title") or torrents[0].get("name") or ""
                 if torrent_title:
-                    logger.info(f"[站点降级] {cfg['domain']} 命中种子标题：{torrent_title}")
+                    logger.info(f"[站点降级] AGSVPT {label} 命中：{torrent_title}")
                     return torrent_title.strip()
-
             except Exception as e:
-                logger.error(f"[站点降级] {cfg['domain']} 查询异常：{e}", exc_info=True)
+                logger.error(f"[站点降级] AGSVPT {label} 异常：{e}", exc_info=True)
 
+        # ── 麒麟(ilolicon) 兜底 ──
+        try:
+            ilolicon_site = SiteOper().get_by_domain("ilolicon.com")
+            ilolicon_index = SitesHelper().get_indexer("ilolicon.com")
+            if ilolicon_site:
+                req_url = (
+                    "https://share.ilolicon.com/torrents.php"
+                    f"?search_mode=0&search_area=0&page=0&notnewword=1&cat=402&search={title}"
+                )
+                logger.info(f"[站点降级] 请求 麒麟：{title}")
+                page_source = self.__get_page_source(url=req_url, site=ilolicon_site)
+                if page_source:
+                    _spider = SiteSpider(indexer=ilolicon_index, page=1)
+                    torrents = _spider.parse(page_source)
+                    if torrents:
+                        torrent_title = torrents[0].get("title") or torrents[0].get("name") or ""
+                        if torrent_title:
+                            logger.info(f"[站点降级] 麒麟 命中：{torrent_title}")
+                            return torrent_title.strip()
+        except Exception as e:
+            logger.error(f"[站点降级] 麒麟 异常：{e}", exc_info=True)
+
+        logger.warning(f"[站点降级] 所有站点均未找到：{title}")
         return None
 
     def __handle_file(self, is_directory: bool, event_path: str, source_dir: str):
@@ -573,174 +594,131 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                     return
 
                 if store_conf == "local":
-                    # 硬链接/移动/复制
+                    # 本地：硬链接/移动/复制，立即执行
                     retcode = self.__transfer_command(file_item=Path(event_path),
                                                       target_file=target_path,
                                                       transfer_type=self._transfer_type)
                 else:
-                    # 源操作对象
-                    source_oper = self.filemanager._FileManagerModule__get_storage_oper("local")
-                    # 目的操作对象
-                    target_oper = self.filemanager._FileManagerModule__get_storage_oper(store_conf)
-                    if not source_oper or not target_oper:
-                        return None, f"不支持的存储类型：{store_conf}"
-                    file_item = FileItem()
-                    file_item.storage = "local"
-                    file_item.path = event_path
-                    new_item, errmsg = TransHandler._TransHandler__transfer_command(fileitem=file_item,
-                                                                                    target_storage=store_conf,
-                                                                                    target_file=Path(
-                                                                                        target_path),
-                                                                                    transfer_type=self._transfer_type,
-                                                                                    source_oper=source_oper,
-                                                                                    target_oper=target_oper)
-                    logger.debug(f"new_item: {new_item} ")
-                    if new_item:
-                        retcode = 0
-                        logger.debug(f"new_item: {new_item} ")
-                    else:
-                        retcode = 1
-                        logger.debug(f"文件整理错误 {errmsg} ")
+                    # 网盘：不立即上传，先做本地刮削，加入批量上传队列
+                    # 目标目录在本地临时区预创建，用于存放 nfo/poster
+                    tmp_dir = Path("/tmp/shortplaymonitormod") / target_path.parent.relative_to(Path("/"))
+                    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+                    # 加入上传队列（视频文件）
+                    entry = self._upload_queue.get(title, {
+                        "files": [], "last_time": self.__get_time(),
+                        "store_conf": store_conf
+                    })
+                    entry["files"].append({
+                        "event_path": event_path,
+                        "target_path": target_path,
+                    })
+                    entry["last_time"] = self.__get_time()
+                    self._upload_queue[title] = entry
+                    logger.info(
+                        f"[上传队列] 剧集「{title}」已入队 {len(entry['files'])} 个文件，"
+                        f"等待静默后批量上传：{Path(event_path).name}"
+                    )
+                    # 网盘模式本阶段视为"准备完成"，后续由 __batch_upload 真正执行
+                    retcode = 0
 
                 if retcode == 0:
                     if store_conf == "local":
-                        logger.info(f"文件 {event_path} 硬链接完成")
-                    else:
-                        logger.info(f"文件 {event_path} 上传完成")
-
-                    # ===== 文件整理成功后，触发CMS通知计数 =====
-                    if self._cms_enabled and self._cms_domain and self._cms_api_token:
-                        self._wait_notify_count += 1
-                        self._last_event_time = self.__get_time()
-                        logger.info(f"短剧整理完成，已标记待CMS通知（当前队列：{self._wait_notify_count}）：{Path(event_path).name}")
+                        logger.info(f"文件 {event_path} 本地整理完成")
 
                     # 生成 tvshow.nfo
-                    logger.debug(f"文件 {event_path} 生成 tvshow.nfo开始")
-                    logger.debug(f"store_conf: {store_conf}")
+                    logger.debug(f"文件 {event_path} 生成 tvshow.nfo 开始")
                     if store_conf == "local":
-                        logger.debug(f"tvshow.nfo exists: {(target_path.parent / 'tvshow.nfo').exists()}")
+                        if not (target_path.parent / "tvshow.nfo").exists():
+                            self.__gen_tv_nfo_file(dir_path=target_path.parent, title=title)
                     else:
-                        logger.debug(
-                            f"tvshow.nfo exists: "
-                            f"{self.filemanager.get_file_item(store_conf, (target_path.parent / 'tvshow.nfo'))}")
-
-                    if store_conf == "local" and not (target_path.parent / "tvshow.nfo").exists():
-                        self.__gen_tv_nfo_file(dir_path=target_path.parent,
-                                               title=title)
-                    # 内存生成nfo
-                    if (store_conf != "local"
-                            and None == self.filemanager.get_file_item(store_conf, (target_path.parent /
-                                                                                    "tvshow.nfo"))):
-                        if not ("/tmp/shortplaymonitormod" / target_path.parent.relative_to(
-                                Path("/")) / "tvshow.nfo").exists():
-                            os.makedirs(
-                                Path("/tmp/shortplaymonitormod" / target_path.parent.relative_to(Path("/"))))
-                            self.__gen_tv_nfo_file(
-                                dir_path=("/tmp/shortplaymonitormod" / target_path.parent.relative_to(Path("/"))),
-                                title=title)
-                            file_item = FileItem()
-                            file_item.storage = "local"
-                            file_item.path = str("/tmp/shortplaymonitormod" / target_path.parent.relative_to(
-                                Path("/")) / "tvshow.nfo")
-                            # 源操作对象
-                            source_oper = self.filemanager._FileManagerModule__get_storage_oper("local")
-                            # 目的操作对象
-                            target_oper = self.filemanager._FileManagerModule__get_storage_oper(store_conf)
-                            if not source_oper or not target_oper:
-                                return None, f"不支持的存储类型：{store_conf}"
-
-                            new_item, errmsg = TransHandler._TransHandler__transfer_command(
-                                fileitem=file_item,
-                                target_storage=store_conf,
-                                target_file=Path(target_path.parent / "tvshow.nfo"),
-                                transfer_type=self._transfer_type,
-                                source_oper=source_oper, target_oper=target_oper)
-                            if new_item:
-                                logger.debug(f"文件 {Path(target_path.parent / 'tvshow.nfo')} 整理完成")
-                            else:
-                                logger.debug((f"文件 {Path(target_path.parent / 'tvshow.nfo')} 整理失败:{errmsg}"))
+                        # 网盘模式：生成到本地临时目录，由批量上传时一并上传
+                        tmp_nfo = Path("/tmp/shortplaymonitormod") / target_path.parent.relative_to(Path("/")) / "tvshow.nfo"
+                        if not tmp_nfo.exists():
+                            self.__gen_tv_nfo_file(dir_path=tmp_nfo.parent, title=title)
+                            logger.debug(f"[刮削] tvshow.nfo 已生成到临时目录：{tmp_nfo}")
+                        # 将 nfo 也加入上传队列
+                        if tmp_nfo.exists():
+                            nfo_item = {
+                                "event_path": str(tmp_nfo),
+                                "target_path": target_path.parent / "tvshow.nfo",
+                            }
+                            if nfo_item not in self._upload_queue[title]["files"]:
+                                self._upload_queue[title]["files"].append(nfo_item)
 
                     # 封面裁剪（持久开关 _image 控制，默认开启）
                     if self._image:
                         logger.debug(f"文件 {event_path} 生成缩略图开始")
                         if store_conf == "local":
-                            logger.debug(f"poster exists: {(target_path.parent / 'poster.jpg').exists()}")
-                        else:
-                            logger.debug(
-                                f"poster exists: "
-                                f"{self.filemanager.get_file_item(store_conf, (target_path.parent / 'poster.jpg'))}")
-
-                        # 本地存储：生成缩略图并裁剪为封面
-                        if (store_conf == "local" and not (target_path.parent / "poster.jpg").exists()):
-                            thumb_path = self.gen_file_thumb(title=title,
-                                                             rename_conf=rename_conf,
-                                                             file_path=target_path)
-                            if thumb_path and Path(thumb_path).exists():
-                                self.__save_poster(input_path=thumb_path,
+                            if not (target_path.parent / "poster.jpg").exists():
+                                thumb_path = self.gen_file_thumb(title=title,
+                                                                 rename_conf=rename_conf,
+                                                                 file_path=target_path)
+                                if thumb_path and Path(thumb_path).exists():
+                                    self.__save_poster(input_path=thumb_path,
+                                                       poster_path=target_path.parent / "poster.jpg",
+                                                       cover_conf=cover_conf)
+                                    if (target_path.parent / "poster.jpg").exists():
+                                        logger.info(f"{target_path.parent / 'poster.jpg'} 缩略图已生成")
+                                    thumb_path.unlink()
+                                else:
+                                    thumb_files = SystemUtils.list_files(
+                                        directory=target_path.parent, extensions=[".jpg"])
+                                    if thumb_files:
+                                        for thumb in thumb_files:
+                                            self.__save_poster(input_path=thumb,
+                                                               poster_path=target_path.parent / "poster.jpg",
+                                                               cover_conf=cover_conf)
+                                            break
+                                        for thumb in thumb_files:
+                                            Path(thumb).unlink()
+                            else:
+                                # poster 已存在，重新裁剪
+                                self.__save_poster(input_path=target_path.parent / "poster.jpg",
                                                    poster_path=target_path.parent / "poster.jpg",
                                                    cover_conf=cover_conf)
-                                if (target_path.parent / "poster.jpg").exists():
-                                    logger.info(f"{target_path.parent / 'poster.jpg'} 缩略图已生成")
-                                thumb_path.unlink()
-                            else:
-                                thumb_files = SystemUtils.list_files(directory=target_path.parent,
-                                                                     extensions=[".jpg"])
-                                if thumb_files:
-                                    for thumb in thumb_files:
-                                        self.__save_poster(input_path=thumb,
-                                                           poster_path=target_path.parent / "poster.jpg",
-                                                           cover_conf=cover_conf)
-                                        break
-                                    for thumb in thumb_files:
-                                        Path(thumb).unlink()
-                        elif (store_conf == "local" and (target_path.parent / "poster.jpg").exists()):
-                            # poster 已存在时，直接对现有 poster 按 cover_conf 比例重新裁剪
-                            self.__save_poster(input_path=target_path.parent / "poster.jpg",
-                                               poster_path=target_path.parent / "poster.jpg",
-                                               cover_conf=cover_conf)
-                            logger.info(f"{target_path.parent / 'poster.jpg'} 封面已重新裁剪")
-
-                        # 网盘存储：本地生成后上传
-                        if (store_conf != "local"
-                                and None == self.filemanager.get_file_item(store_conf,
-                                                                           (target_path.parent / "poster.jpg"))):
-                            thumb_path = self.gen_file_thumb(title=title,
-                                                             rename_conf=rename_conf,
-                                                             file_path=Path(event_path),
-                                                             to_thumb_path="/tmp/shortplaymonitormod" /
-                                                                           target_path.parent.relative_to(
-                                                                               Path("/")))
-                            if thumb_path and Path(thumb_path).exists():
-                                self.__save_poster(input_path=thumb_path,
-                                                   poster_path="/tmp/shortplaymonitormod" /
-                                                               target_path.parent.relative_to(
-                                                                   Path("/")) / "poster.jpg",
-                                                   cover_conf=cover_conf)
-                                if ("/tmp/shortplaymonitormod" / target_path.parent.relative_to(
-                                        Path("/")) / "poster.jpg").exists():
-                                    file_item = FileItem()
-                                    file_item.storage = "local"
-                                    file_item.path = str(
-                                        "/tmp/shortplaymonitormod" / target_path.parent.relative_to(
-                                            Path("/")) / "poster.jpg")
-                                    source_oper = self.filemanager._FileManagerModule__get_storage_oper("local")
-                                    target_oper = self.filemanager._FileManagerModule__get_storage_oper(store_conf)
-                                    if not source_oper or not target_oper:
-                                        return None, f"不支持的存储类型：{store_conf}"
-                                    new_item, errmsg = TransHandler._TransHandler__transfer_command(
-                                        fileitem=file_item,
-                                        target_storage=store_conf,
-                                        target_file=Path(target_path.parent / "poster.jpg"),
-                                        transfer_type=self._transfer_type, source_oper=source_oper,
-                                        target_oper=target_oper)
-                                    if new_item:
-                                        logger.debug(f"{target_path.parent / 'poster.jpg'} 缩略图已整理")
-                                    logger.info(f"{target_path.parent / 'poster.jpg'} 缩略图已生成")
+                                logger.info(f"{target_path.parent / 'poster.jpg'} 封面已重新裁剪")
+                        else:
+                            # 网盘模式：生成 poster 到本地临时目录，由批量上传时一并上传
+                            tmp_poster = (Path("/tmp/shortplaymonitormod") /
+                                          target_path.parent.relative_to(Path("/")) / "poster.jpg")
+                            if not tmp_poster.exists():
+                                thumb_path = self.gen_file_thumb(
+                                    title=title, rename_conf=rename_conf,
+                                    file_path=Path(event_path),
+                                    to_thumb_path=tmp_poster.parent)
+                                if thumb_path and Path(thumb_path).exists():
+                                    self.__save_poster(input_path=thumb_path,
+                                                       poster_path=tmp_poster,
+                                                       cover_conf=cover_conf)
+                                    if tmp_poster.exists():
+                                        logger.info(f"[刮削] poster.jpg 已生成到临时目录：{tmp_poster}")
                                     thumb_path.unlink()
+                            # 将 poster 加入上传队列
+                            if tmp_poster.exists():
+                                poster_item = {
+                                    "event_path": str(tmp_poster),
+                                    "target_path": target_path.parent / "poster.jpg",
+                                }
+                                if poster_item not in self._upload_queue[title]["files"]:
+                                    self._upload_queue[title]["files"].append(poster_item)
                     else:
                         logger.debug(f"封面裁剪开关已关闭，跳过缩略图生成")
+
+                    # 本地模式：整理成功后直接记入CMS通知队列
+                    if store_conf == "local":
+                        if self._cms_enabled and self._cms_domain and self._cms_api_token:
+                            now = self.__get_time()
+                            n_entry = self._pending_notify.get(title, {"count": 0, "last_time": now})
+                            n_entry["count"] += 1
+                            n_entry["last_time"] = now
+                            self._pending_notify[title] = n_entry
+                            logger.info(
+                                f"[CMS待通知] 剧集「{title}」已整理 {n_entry['count']} 集，"
+                                f"最后更新：{Path(event_path).name}"
+                            )
                 else:
-                    logger.error(f"文件 {event_path} 硬链接失败，错误码：{retcode}")
+                    logger.error(f"文件 {event_path} 本地整理失败，错误码：{retcode}")
 
             if self._notify:
                 # 发送消息汇总
@@ -765,7 +743,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
 
         except Exception as e:
             logger.error(f"event_handler_created error: {e}", exc_info=True)
-        if Path('/tmp/shortplaymonitormod/').exists():
+        # 本地模式的临时文件立即清理；网盘模式临时文件由 __batch_upload 上传后统一清理
+        if store_conf == "local" and Path('/tmp/shortplaymonitormod/').exists():
             shutil.rmtree('/tmp/shortplaymonitormod/')
         logger.info(f"文件 {event_path} 处理完成")
 
@@ -801,34 +780,142 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     def __get_time(self):
         return int(time.time())
 
+    def __batch_upload(self):
+        """
+        定时任务（每30秒）：检查上传队列，对静默超过60秒的剧集执行批量上传。
+        上传顺序：视频文件 → nfo → poster，全部完成后记入CMS通知队列。
+        不改动 MP 的 115.py 等存储模块，直接复用 TransHandler。
+        """
+        if not self._upload_queue:
+            return
+
+        now = self.__get_time()
+        ready_titles = [
+            t for t, e in self._upload_queue.items()
+            if now - e["last_time"] >= 60
+        ]
+        if not ready_titles:
+            for t, e in self._upload_queue.items():
+                logger.info(
+                    f"[批量上传] 剧集「{t}」队列 {len(e['files'])} 个文件，"
+                    f"距上次入队 {now - e['last_time']:.0f}s，继续等待..."
+                )
+            return
+
+        for title in ready_titles:
+            entry = self._upload_queue.pop(title)
+            store_conf = entry["store_conf"]
+            files = entry["files"]
+            logger.info(f"[批量上传] 剧集「{title}」开始批量上传，共 {len(files)} 个文件，目标存储：{store_conf}")
+
+            try:
+                source_oper = self.filemanager._FileManagerModule__get_storage_oper("local")
+                target_oper = self.filemanager._FileManagerModule__get_storage_oper(store_conf)
+                if not source_oper or not target_oper:
+                    logger.error(f"[批量上传] 不支持的存储类型：{store_conf}")
+                    continue
+
+                success_count = 0
+                fail_count = 0
+                for f in files:
+                    event_path = f["event_path"]
+                    target_path = f["target_path"]
+                    try:
+                        file_item = FileItem()
+                        file_item.storage = "local"
+                        file_item.path = str(event_path)
+                        new_item, errmsg = TransHandler._TransHandler__transfer_command(
+                            fileitem=file_item,
+                            target_storage=store_conf,
+                            target_file=Path(target_path),
+                            transfer_type=self._transfer_type,
+                            source_oper=source_oper,
+                            target_oper=target_oper
+                        )
+                        if new_item:
+                            success_count += 1
+                            logger.debug(f"[批量上传] ✓ {Path(event_path).name} → {target_path}")
+                        else:
+                            fail_count += 1
+                            logger.error(f"[批量上传] ✗ {Path(event_path).name} 失败：{errmsg}")
+                    except Exception as e:
+                        fail_count += 1
+                        logger.error(f"[批量上传] ✗ {Path(event_path).name} 异常：{e}", exc_info=True)
+
+                logger.info(
+                    f"[批量上传] 剧集「{title}」上传完成，"
+                    f"成功 {success_count} 个，失败 {fail_count} 个"
+                )
+
+                # 上传完成后记入CMS通知队列（无论是否有失败，都触发增量同步）
+                if success_count > 0 and self._cms_enabled and self._cms_domain and self._cms_api_token:
+                    n_entry = self._pending_notify.get(title, {"count": 0, "last_time": now})
+                    n_entry["count"] += success_count
+                    n_entry["last_time"] = now
+                    self._pending_notify[title] = n_entry
+                    logger.info(f"[批量上传] 剧集「{title}」已记入CMS通知队列")
+
+            except Exception as e:
+                logger.error(f"[批量上传] 剧集「{title}」批量上传异常：{e}", exc_info=True)
+
+            finally:
+                # 清理临时目录
+                if Path('/tmp/shortplaymonitormod/').exists():
+                    shutil.rmtree('/tmp/shortplaymonitormod/')
+
     def __notify_cms(self):
         """
-        定时检查并通知CMS执行增量同步
-        每分钟触发一次，满足条件后才真正发出通知：
-        - 队列超过1000个文件，立即通知；
-        - 或队列非空且距最后一次整理事件已超过60秒（静默期），才通知。
+        定时检查（每分钟）并通知CMS执行增量同步。
+        按剧集分组追踪，每个剧集最后一集整理完成后静默60秒再发通知，
+        避免一集一集上传时频繁触发CMS增量同步。
+        所有待通知剧集合并为一次CMS请求。
         """
         try:
-            if self._wait_notify_count > 0 and (
-                    self._wait_notify_count > 1000 or self.__get_time() - self._last_event_time > 60):
-                url = (f"{self._cms_domain}/api/sync/lift_by_token"
-                       f"?token={self._cms_api_token}&type={self._cms_notify_type}")
-                ret = RequestUtils().get_res(url)
-                if ret:
-                    logger.info(f"通知CMS执行增量同步成功（共{self._wait_notify_count}个文件）")
-                    self._wait_notify_count = 0
-                elif ret is not None:
-                    logger.error(
-                        f"通知CMS失败，状态码：{ret.status_code}，返回信息：{ret.text} {ret.reason}")
-                else:
-                    logger.error("通知CMS失败，未获取到返回信息")
-            else:
-                if self._wait_notify_count > 0:
+            if not self._pending_notify:
+                return
+
+            now = self.__get_time()
+            ready_titles = []
+
+            for title, entry in list(self._pending_notify.items()):
+                elapsed = now - entry["last_time"]
+                if elapsed >= 60:
+                    # 该剧集已静默60秒，视为全部上传完毕
+                    ready_titles.append(title)
                     logger.info(
-                        f"等待CMS通知，队列数量：{self._wait_notify_count}，"
-                        f"距上次整理：{self.__get_time() - self._last_event_time}秒")
+                        f"[CMS通知] 剧集「{title}」共 {entry['count']} 集，"
+                        f"已静默 {elapsed:.0f}s，准备通知CMS"
+                    )
+                else:
+                    logger.info(
+                        f"[CMS等待] 剧集「{title}」共 {entry['count']} 集，"
+                        f"距上次整理 {elapsed:.0f}s，继续等待..."
+                    )
+
+            if not ready_titles:
+                return
+
+            # 所有就绪剧集合并触发一次CMS通知
+            url = (f"{self._cms_domain}/api/sync/lift_by_token"
+                   f"?token={self._cms_api_token}&type={self._cms_notify_type}")
+            ret = RequestUtils().get_res(url)
+            if ret:
+                total = sum(self._pending_notify[t]["count"] for t in ready_titles)
+                logger.info(
+                    f"[CMS通知] 成功！本次通知剧集：{ready_titles}，共 {total} 集"
+                )
+                for t in ready_titles:
+                    del self._pending_notify[t]
+            elif ret is not None:
+                logger.error(
+                    f"[CMS通知] 失败，状态码：{ret.status_code}，"
+                    f"返回信息：{ret.text} {ret.reason}"
+                )
+            else:
+                logger.error("[CMS通知] 失败，未获取到返回信息")
+
         except Exception as e:
-            logger.error(f"通知CMS发生异常：{e}")
+            logger.error(f"[CMS通知] 发生异常：{e}", exc_info=True)
 
     # ===== 工具方法 =====
 
@@ -893,64 +980,83 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     def gen_file_thumb_from_site(self, title: str, file_path: Path):
         try:
             image = None
-            domain = "agsvpt.com"
-            site = SiteOper().get_by_domain(domain)
-            index = SitesHelper().get_indexer(domain)
-            if site:
-                req_url = (f"https://www.agsvpt.com/torrents.php?search_mode=0&search_area=0&page=0&notnewword=1&cat"
-                           f"=419&search={title}")
-                image_xpath = "//*[@id='kdescr']/img[1]/@src"
-                logger.info(f"开始检索 {site.name} {title}")
-                image = self.__get_site_torrents(url=req_url, site=site, index=index, image_xpath=image_xpath)
+            # ── AGSVPT ──
+            url_map = {
+                "pt.agsvpt.cn":   "https://pt.agsvpt.cn/torrents.php",
+                "www.agsvpt.com": "https://www.agsvpt.com/torrents.php",
+            }
+            for site, index, label in self.__get_agsvpt_site():
+                base_url = url_map.get(label, "https://www.agsvpt.com/torrents.php")
+                req_url = self._AGSVPT_SEARCH_TPL.format(base=base_url, title=title)
+                logger.info(f"[封面] 检索 AGSVPT {label}：{title}")
+                image = self.__get_site_torrents(
+                    url=req_url, site=site, index=index,
+                    image_xpath="//*[@id='kdescr']/img[1]/@src"
+                )
+                if image:
+                    logger.info(f"[封面] AGSVPT {label} 命中")
+                    break
+                logger.debug(f"[封面] AGSVPT {label} 未找到")
+            # ── 麒麟(ilolicon) 兜底 ──
             if not image:
-                domain = "ilolicon.com"
-                site = SiteOper().get_by_domain(domain)
-                index = SitesHelper().get_indexer(domain)
-                if site:
-                    req_url = (f"https://share.ilolicon.com/torrents.php?search_mode=0&search_area=0&page=0&notnewword"
-                               f"=1&cat=402&search={title}")
-                    image_xpath = "//*[@id='kdescr']/img[1]/@src"
-                    logger.info(f"开始检索 {site.name} {title}")
-                    image = self.__get_site_torrents(url=req_url, site=site, index=index, image_xpath=image_xpath)
+                ilolicon_site = SiteOper().get_by_domain("ilolicon.com")
+                ilolicon_index = SitesHelper().get_indexer("ilolicon.com")
+                if ilolicon_site:
+                    req_url = (f"https://share.ilolicon.com/torrents.php"
+                               f"?search_mode=0&search_area=0&page=0&notnewword=1&cat=402&search={title}")
+                    logger.info(f"[封面] 检索 麒麟：{title}")
+                    image = self.__get_site_torrents(
+                        url=req_url, site=ilolicon_site, index=ilolicon_index,
+                        image_xpath="//*[@id='kdescr']/img[1]/@src"
+                    )
             if not image:
-                logger.error(f"检索站点 {title} 封面失败")
+                logger.error(f"[封面] 所有站点均未找到：{title}")
                 return None
             if self.__save_image(url=image, file_path=file_path):
                 return file_path
             return None
         except Exception as e:
-            logger.error(f"检索站点 {title} 封面失败 {str(e)}", exc_info=True)
+            logger.error(f"[封面] 检索异常：{title}，{str(e)}", exc_info=True)
             return None
 
     def gen_desc_from_site(self, title: str):
         try:
             desc = None
-            domain = "agsvpt.com"
-            site = SiteOper().get_by_domain(domain)
-            index = SitesHelper().get_indexer(domain)
-            if site:
-                req_url = (f"https://www.agsvpt.com/torrents.php?search_mode=0&search_area=0&page=0&notnewword=1&cat"
-                           f"=419&search={title}")
-                desc_xpath = "//*[@id='kdescr']/text()"
-                logger.info(f"开始检索 {site.name} {title}")
-                desc = self.__get_site_torrents(url=req_url, site=site, index=index, desc_xpath=desc_xpath)
+            # ── AGSVPT ──
+            url_map = {
+                "pt.agsvpt.cn":   "https://pt.agsvpt.cn/torrents.php",
+                "www.agsvpt.com": "https://www.agsvpt.com/torrents.php",
+            }
+            for site, index, label in self.__get_agsvpt_site():
+                base_url = url_map.get(label, "https://www.agsvpt.com/torrents.php")
+                req_url = self._AGSVPT_SEARCH_TPL.format(base=base_url, title=title)
+                logger.info(f"[简介] 检索 AGSVPT {label}：{title}")
+                desc = self.__get_site_torrents(
+                    url=req_url, site=site, index=index,
+                    desc_xpath="//*[@id='kdescr']/text()"
+                )
+                if desc:
+                    logger.info(f"[简介] AGSVPT {label} 命中")
+                    break
+                logger.debug(f"[简介] AGSVPT {label} 未找到")
+            # ── 麒麟(ilolicon) 兜底 ──
             if not desc:
-                domain = "ilolicon.com"
-                site = SiteOper().get_by_domain(domain)
-                index = SitesHelper().get_indexer(domain)
-                if site:
-                    req_url = (f"https://share.ilolicon.com/torrents.php?search_mode=0&search_area=0&page=0&notnewword"
-                               f"=1&cat=402&search={title}")
-                    desc_xpath = "//*[@id='kdescr']/text()"
-                    logger.info(f"开始检索 {site.name} {title}")
-                    desc = self.__get_site_torrents(url=req_url, site=site, index=index, desc_xpath=desc_xpath)
+                ilolicon_site = SiteOper().get_by_domain("ilolicon.com")
+                ilolicon_index = SitesHelper().get_indexer("ilolicon.com")
+                if ilolicon_site:
+                    req_url = (f"https://share.ilolicon.com/torrents.php"
+                               f"?search_mode=0&search_area=0&page=0&notnewword=1&cat=402&search={title}")
+                    logger.info(f"[简介] 检索 麒麟：{title}")
+                    desc = self.__get_site_torrents(
+                        url=req_url, site=ilolicon_site, index=ilolicon_index,
+                        desc_xpath="//*[@id='kdescr']/text()"
+                    )
             if not desc:
-                logger.error(f"检索站点 {title} 简介失败")
+                logger.error(f"[简介] 所有站点均未找到：{title}")
                 return None
-            else:
-                return desc
+            return desc
         except Exception as e:
-            logger.error(f"检索站点 {title} 简介失败 {str(e)}", exc_info=True)
+            logger.error(f"[简介] 检索异常：{title}，{str(e)}", exc_info=True)
             return None
 
     @retry(RequestException, logger=logger)
@@ -1002,6 +1108,56 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                 logger.error(f"未获取到种子简介 {torrents[0].get('page_url')}")
                 return None
             return self.clean_text_list(desc)[-1]
+
+    # AGSVPT 搜索 URL 模板
+    _AGSVPT_SEARCH_TPL = (
+        "{base}?search_mode=0&search_area=0&page=0&notnewword=1&cat=419&search={title}"
+    )
+
+    def __get_agsvpt_site(self):
+        """
+        返回可用于 AGSVPT 请求的配置列表，每项为 (cookie, index, label)。
+
+        双 Cookie 模式（_agsvpt_dual_cookie=True）：
+          - 直接使用 WebUI 填写的两个 Cookie，各自对应一个 URL，互相独立请求。
+          - 返回 [(cookie_pt, index_pt, "pt.agsvpt.cn"),
+                  (cookie_www, index_www, "www.agsvpt.com")]
+            其中 Cookie 为空的条目会被跳过。
+
+        单站点模式（默认）：
+          - 从 MP 站点管理里找已配置的 AGSVPT（agsvpt.com），只用这一个 Cookie。
+          - 仅查询 www.agsvpt.com，失败即失败，不做 URL 轮询。
+          - 返回 [(mp_cookie, mp_index, "www.agsvpt.com")]
+
+        返回空列表表示无可用配置。
+        """
+        if self._agsvpt_dual_cookie:
+            # 双 Cookie 模式：用 WebUI 填写的 Cookie 构造伪 site 对象
+            results = []
+            for cookie, domain, label in [
+                (self._agsvpt_cookie_pt,  "pt.agsvpt.cn",  "pt.agsvpt.cn"),
+                (self._agsvpt_cookie_www, "agsvpt.com",    "www.agsvpt.com"),
+            ]:
+                if not cookie or not cookie.strip():
+                    logger.debug(f"[AGSVPT] 双Cookie模式：{label} Cookie 未填写，跳过")
+                    continue
+                index = SitesHelper().get_indexer(domain)
+                # 构造一个只含 cookie 属性的简单对象，供 __get_page_source 使用
+                class _FakeSite:
+                    def __init__(self, c): self.cookie = c; self.name = label
+                results.append((_FakeSite(cookie.strip()), index, label))
+            if not results:
+                logger.warning("[AGSVPT] 双Cookie模式已开启但两个Cookie均未填写")
+            return results
+        else:
+            # 单站点模式：从 MP 站点管理取已配置的 AGSVPT
+            site = SiteOper().get_by_domain("agsvpt.com")
+            index = SitesHelper().get_indexer("agsvpt.com")
+            if site:
+                logger.debug("[AGSVPT] 单站点模式：使用 MP 配置的 www.agsvpt.com")
+                return [(site, index, "www.agsvpt.com")]
+            logger.debug("[AGSVPT] 单站点模式：MP 中未配置 agsvpt.com")
+            return []
 
     def __get_page_source(self, url: str, site):
         ret = RequestUtils(
@@ -1089,6 +1245,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "cms_domain": self._cms_domain,
             "cms_api_token": self._cms_api_token,
             "site_fallback": self._site_fallback,
+            "agsvpt_dual_cookie": self._agsvpt_dual_cookie,
+            "agsvpt_cookie_pt": self._agsvpt_cookie_pt,
+            "agsvpt_cookie_www": self._agsvpt_cookie_www,
         })
 
     def get_state(self) -> bool:
@@ -1261,6 +1420,91 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             }
                         ]
                     },
+                    # ===== 分隔线：AGSVPT 双Cookie配置区 =====
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '── AGSVPT 双域名 Cookie 配置（可选） ──'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'agsvpt_dual_cookie',
+                                            'label': '启用AGSVPT双域名Cookie',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'warning',
+                                            'variant': 'tonal',
+                                            'text': '开启后不依赖MP站点管理，使用下方填写的Cookie依次查询两个域名；关闭则仅使用MP站点管理中配置的 agsvpt.com。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'agsvpt_cookie_pt',
+                                            'label': 'pt.agsvpt.cn Cookie',
+                                            'placeholder': '留空则跳过此域名',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'agsvpt_cookie_www',
+                                            'label': 'www.agsvpt.com Cookie',
+                                            'placeholder': '留空则跳过此域名',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     # ===== 分隔线：CMS通知配置区 =====
                     {
                         'component': 'VRow',
@@ -1426,6 +1670,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "exclude_keywords": "",
             "transfer_type": "link",
             "site_fallback": True,
+            "agsvpt_dual_cookie": False,
+            "agsvpt_cookie_pt": "",
+            "agsvpt_cookie_www": "",
             "cms_enabled": False,
             "cms_notify_type": "lift_sync",
             "cms_api_token": "cloud_media_sync",
