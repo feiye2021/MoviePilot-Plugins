@@ -3,11 +3,12 @@
         "name": "短剧刮削+CMS通知",
         "description": "监控视频短剧创建、刮削，刮削完成后通知CMS增量更新，支持目的目录为网盘。(基于thsrite、Seed680、imaliang三位大佬原版魔改)",
         "labels": "短剧",
-        "version": "1.0.3",
+        "version": "1.0.4",
         "icon": "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png",
         "author": "feiye",
         "level": 1,
         "history": {
+            "v1.0.4": "1. 优化通知逻辑，改为剧集整理完成后统一通知。2. 修复整理、通知等多项bug。",
             "v1.0.3": "1.AGSVPT增加双域名刮削开关，打开后需自行填写www.agsvpt.com和pt.agsvpt.cn的Cookie，不再依赖MP的站点管理，如关闭则依赖MP站点管理进行刮削。2. 115网盘上传逻辑更新，不再每集触发，待一部剧集结束统一触发上传。",            
             "v1.0.2": "1.剪裁按钮改为持久按钮，开启后会持续进行。2.剪裁按钮和降级按钮默认为开启。",
             "v1.0.1": "1.优化刮削逻辑。2.新增降级网站刮削开关。",

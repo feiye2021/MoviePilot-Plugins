@@ -68,7 +68,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png"
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -121,12 +121,20 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
 
+    # 已处理文件记录的持久化路径（跨重启保留，防止重复上传）
+    _HANDLED_RECORD_PATH = Path("/tmp/shortplaymonitormod_handled.json")
+
     def init_plugin(self, config: dict = None):
-        # 清空配置
+        # 清空配置及运行时队列（防止插件重载时旧数据残留导致重复处理）
         self._dirconf = {}
         self._renameconf = {}
         self._coverconf = {}
         self._storeconf = {}
+        self._medias = {}
+        self._pending_notify = {}
+        self._upload_queue = {}
+        # 加载持久化的已处理文件记录（重启后保留，防止网盘文件重复上传）
+        self._handled_paths: set = self.__load_handled_record()
         self.tmdbchain = TmdbChain()
         self.mediachain = MediaChain()
         self.filemanager = FileManagerModule()
@@ -600,18 +608,29 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                                       transfer_type=self._transfer_type)
                 else:
                     # 网盘：不立即上传，先做本地刮削，加入批量上传队列
+                    # ── 去重1：持久化记录检查，防止重启后重复处理 ──
+                    if self.__is_handled(event_path):
+                        logger.info(f"[去重] 文件已在历史记录中，跳过：{Path(event_path).name}")
+                        return
+                    # ── 去重2：内存队列检查，防止同次运行内 watchdog 重复触发 ──
+                    existing_entry = self._upload_queue.get(title, {})
+                    existing_paths = {f["event_path"] for f in existing_entry.get("files", [])}
+                    if event_path in existing_paths:
+                        logger.info(f"[上传队列] 文件已在队列中，跳过重复入队：{Path(event_path).name}")
+                        return
+
                     # 目标目录在本地临时区预创建，用于存放 nfo/poster
                     tmp_dir = Path("/tmp/shortplaymonitormod") / target_path.parent.relative_to(Path("/"))
                     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-                    # 加入上传队列（视频文件）
+                    # 加入上传队列（视频文件），target_path 统一转为字符串存储
                     entry = self._upload_queue.get(title, {
                         "files": [], "last_time": self.__get_time(),
                         "store_conf": store_conf
                     })
                     entry["files"].append({
-                        "event_path": event_path,
-                        "target_path": target_path,
+                        "event_path": str(event_path),
+                        "target_path": str(target_path),
                     })
                     entry["last_time"] = self.__get_time()
                     self._upload_queue[title] = entry
@@ -637,14 +656,15 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                         if not tmp_nfo.exists():
                             self.__gen_tv_nfo_file(dir_path=tmp_nfo.parent, title=title)
                             logger.debug(f"[刮削] tvshow.nfo 已生成到临时目录：{tmp_nfo}")
-                        # 将 nfo 也加入上传队列
+                        # 将 nfo 也加入上传队列（去重：按 event_path 字符串比对）
                         if tmp_nfo.exists():
-                            nfo_item = {
-                                "event_path": str(tmp_nfo),
-                                "target_path": target_path.parent / "tvshow.nfo",
-                            }
-                            if nfo_item not in self._upload_queue[title]["files"]:
-                                self._upload_queue[title]["files"].append(nfo_item)
+                            nfo_ep = str(tmp_nfo)
+                            existing_eps = {f["event_path"] for f in self._upload_queue[title]["files"]}
+                            if nfo_ep not in existing_eps:
+                                self._upload_queue[title]["files"].append({
+                                    "event_path": nfo_ep,
+                                    "target_path": str(target_path.parent / "tvshow.nfo"),
+                                })
 
                     # 封面裁剪（持久开关 _image 控制，默认开启）
                     if self._image:
@@ -694,14 +714,15 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                     if tmp_poster.exists():
                                         logger.info(f"[刮削] poster.jpg 已生成到临时目录：{tmp_poster}")
                                     thumb_path.unlink()
-                            # 将 poster 加入上传队列
+                            # 将 poster 加入上传队列（去重：按 event_path 字符串比对）
                             if tmp_poster.exists():
-                                poster_item = {
-                                    "event_path": str(tmp_poster),
-                                    "target_path": target_path.parent / "poster.jpg",
-                                }
-                                if poster_item not in self._upload_queue[title]["files"]:
-                                    self._upload_queue[title]["files"].append(poster_item)
+                                poster_ep = str(tmp_poster)
+                                existing_eps = {f["event_path"] for f in self._upload_queue[title]["files"]}
+                                if poster_ep not in existing_eps:
+                                    self._upload_queue[title]["files"].append({
+                                        "event_path": poster_ep,
+                                        "target_path": str(target_path.parent / "poster.jpg"),
+                                    })
                     else:
                         logger.debug(f"封面裁剪开关已关闭，跳过缩略图生成")
 
@@ -709,9 +730,13 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                     if store_conf == "local":
                         if self._cms_enabled and self._cms_domain and self._cms_api_token:
                             now = self.__get_time()
-                            n_entry = self._pending_notify.get(title, {"count": 0, "last_time": now})
+                            n_entry = self._pending_notify.get(title, {
+                                "count": 0, "last_time": now, "video_files": []
+                            })
                             n_entry["count"] += 1
                             n_entry["last_time"] = now
+                            # 带上视频文件路径，CMS通知成功后用于写 _medias
+                            n_entry.setdefault("video_files", []).append(str(event_path))
                             self._pending_notify[title] = n_entry
                             logger.info(
                                 f"[CMS待通知] 剧集「{title}」已整理 {n_entry['count']} 集，"
@@ -720,26 +745,13 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                 else:
                     logger.error(f"文件 {event_path} 本地整理失败，错误码：{retcode}")
 
-            if self._notify:
-                # 发送消息汇总
-                media_list = self._medias.get(title) or {}
-                if media_list:
-                    media_files = media_list.get("files") or []
-                    if media_files:
-                        if str(event_path) not in media_files:
-                            media_files.append(str(event_path))
-                    else:
-                        media_files = [str(event_path)]
-                    media_list = {
-                        "files": media_files,
-                        "time": datetime.datetime.now()
-                    }
-                else:
-                    media_list = {
-                        "files": [str(event_path)],
-                        "time": datetime.datetime.now()
-                    }
-                self._medias[title] = media_list
+            # _medias 不在此处写入，改为在上传+CMS完成后才记录，
+            # 确保通知在整个流程（上传→CMS）完成后才发出。
+            # 见 __batch_upload（网盘模式）和 __notify_cms（CMS完成后）写入逻辑。
+            # 本地且未开启CMS时，在 __handle_file_local_done 中写入。
+            if self._notify and store_conf == "local" and not self._cms_enabled:
+                # 本地模式且未开启CMS：整理完成即为全部完成，直接记录
+                self.__record_media(title, event_path)
 
         except Exception as e:
             logger.error(f"event_handler_created error: {e}", exc_info=True)
@@ -748,32 +760,87 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             shutil.rmtree('/tmp/shortplaymonitormod/')
         logger.info(f"文件 {event_path} 处理完成")
 
+    def __load_handled_record(self) -> set:
+        """从持久化文件加载已处理的源文件路径集合，重启后防止重复上传。"""
+        try:
+            if self._HANDLED_RECORD_PATH.exists():
+                import json
+                data = json.loads(self._HANDLED_RECORD_PATH.read_text(encoding="utf-8"))
+                paths = set(data.get("handled", []))
+                logger.info(f"[去重记录] 已加载 {len(paths)} 条历史处理记录")
+                return paths
+        except Exception as e:
+            logger.error(f"[去重记录] 加载历史记录失败：{e}")
+        return set()
+
+    def __save_handled_record(self):
+        """将已处理路径集合持久化到文件。"""
+        try:
+            import json
+            self._HANDLED_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._HANDLED_RECORD_PATH.write_text(
+                json.dumps({"handled": list(self._handled_paths)}, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except Exception as e:
+            logger.error(f"[去重记录] 保存历史记录失败：{e}")
+
+    def __mark_handled(self, event_path: str):
+        """标记一个源文件已处理，并持久化。"""
+        self._handled_paths.add(str(event_path))
+        self.__save_handled_record()
+
+    def __is_handled(self, event_path: str) -> bool:
+        """判断源文件是否已处理过。"""
+        return str(event_path) in self._handled_paths
+
+    def __record_media(self, title: str, event_path: str):
+        """
+        将一个已完成整理的文件记录到 _medias，供 send_msg 汇总通知。
+        只在整个处理链（上传+CMS）完成后才调用，确保通知时序正确。
+        """
+        if not self._notify:
+            return
+        media_list = self._medias.get(title) or {}
+        media_files = media_list.get("files") or []
+        if str(event_path) not in media_files:
+            media_files.append(str(event_path))
+        self._medias[title] = {
+            "files": media_files,
+            "time": datetime.datetime.now()
+        }
+        logger.debug(f"[通知记录] 剧集「{title}」累计 {len(media_files)} 集待通知")
+
     def send_msg(self):
         """
-        定时检查是否有媒体处理完，发送统一消息
+        定时检查是否有媒体处理完，发送统一消息。
+        改为全剧静默（interval秒内无新文件）后发一次，统计总集数，不再每集发一条。
         """
-        if self._notify:
-            if not self._medias or not self._medias.keys():
-                return
+        if not self._notify:
+            return
+        if not self._medias:
+            return
 
-            for medis_title_year in list(self._medias.keys()):
-                media_list = self._medias.get(medis_title_year)
-                logger.info(f"开始处理媒体 {medis_title_year} 消息")
-
-                if not media_list:
-                    continue
-
-                last_update_time = media_list.get("time")
-                media_files = media_list.get("files")
-                if not last_update_time or not media_files:
-                    continue
-
-                if (datetime.datetime.now() - last_update_time).total_seconds() > int(self._interval):
-                    self.post_message(mtype=NotificationType.Organize,
-                                      title=f"{medis_title_year} 共{len(media_files)}集已入库",
-                                      text="类别：短剧")
-                    del self._medias[medis_title_year]
-                    continue
+        now = datetime.datetime.now()
+        for title in list(self._medias.keys()):
+            media_list = self._medias.get(title)
+            if not media_list:
+                continue
+            last_update_time = media_list.get("time")
+            media_files = media_list.get("files") or []
+            if not last_update_time or not media_files:
+                continue
+            # 只有静默超过 interval 秒（无新文件进来）才发通知
+            elapsed = (now - last_update_time).total_seconds()
+            if elapsed > int(self._interval):
+                ep_count = len(media_files)
+                logger.info(f"[通知] 剧集「{title}」共 {ep_count} 集入库，发送汇总消息")
+                self.post_message(
+                    mtype=NotificationType.Organize,
+                    title=f"【短剧入库】{title}",
+                    text=f"共整理 {ep_count} 集已入库完成"
+                )
+                del self._medias[title]
 
     # ===== CMS通知相关方法 =====
 
@@ -834,6 +901,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                         )
                         if new_item:
                             success_count += 1
+                            # 上传成功后持久化标记，防止重启后重复上传
+                            self.__mark_handled(event_path)
                             logger.debug(f"[批量上传] ✓ {Path(event_path).name} → {target_path}")
                         else:
                             fail_count += 1
@@ -847,13 +916,40 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                     f"成功 {success_count} 个，失败 {fail_count} 个"
                 )
 
-                # 上传完成后记入CMS通知队列（无论是否有失败，都触发增量同步）
-                if success_count > 0 and self._cms_enabled and self._cms_domain and self._cms_api_token:
-                    n_entry = self._pending_notify.get(title, {"count": 0, "last_time": now})
-                    n_entry["count"] += success_count
-                    n_entry["last_time"] = now
-                    self._pending_notify[title] = n_entry
-                    logger.info(f"[批量上传] 剧集「{title}」已记入CMS通知队列")
+                # 上传完成后的后续处理
+                if success_count > 0:
+                    # 只上传视频文件（排除 nfo/poster）才计入集数
+                    video_exts = {e.lower() for e in settings.RMT_MEDIAEXT}
+                    video_files = [
+                        f for f in files
+                        if Path(f["event_path"]).suffix.lower() in video_exts
+                    ]
+                    video_count = len(video_files)
+
+                    if self._cms_enabled and self._cms_domain and self._cms_api_token:
+                        # 有CMS：记入通知队列，_medias 在CMS通知成功后写入
+                        # 同时把视频文件列表带过去，CMS成功后用于写 _medias
+                        n_entry = self._pending_notify.get(title, {
+                            "count": 0, "last_time": now, "video_files": []
+                        })
+                        n_entry["count"] += video_count
+                        n_entry["last_time"] = now
+                        n_entry.setdefault("video_files", []).extend(
+                            f["event_path"] for f in video_files
+                        )
+                        self._pending_notify[title] = n_entry
+                        logger.info(
+                            f"[批量上传] 剧集「{title}」{video_count} 集已记入CMS通知队列，"
+                            f"等待CMS通知完成后发送入库通知"
+                        )
+                    else:
+                        # 无CMS：上传完成即为全部完成，直接写 _medias 触发通知
+                        for f in video_files:
+                            self.__record_media(title, f["event_path"])
+                        logger.info(
+                            f"[批量上传] 剧集「{title}」{video_count} 集上传完成，"
+                            f"已记录入库通知（无CMS）"
+                        )
 
             except Exception as e:
                 logger.error(f"[批量上传] 剧集「{title}」批量上传异常：{e}", exc_info=True)
@@ -904,7 +1000,19 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                 logger.info(
                     f"[CMS通知] 成功！本次通知剧集：{ready_titles}，共 {total} 集"
                 )
+                # CMS 通知成功后，才写入 _medias 触发入库通知
+                # video_files 由 __batch_upload（网盘）或本地整理时写入 pending_notify
                 for t in ready_titles:
+                    video_files = self._pending_notify[t].get("video_files", [])
+                    if video_files:
+                        for vf in video_files:
+                            self.__record_media(t, vf)
+                        logger.info(f"[CMS通知] 剧集「{t}」{len(video_files)} 集已记录入库通知")
+                    else:
+                        # 兜底：没有具体文件列表时用集数生成占位记录
+                        count = self._pending_notify[t]["count"]
+                        for i in range(count):
+                            self.__record_media(t, f"episode_{i+1}")
                     del self._pending_notify[t]
             elif ret is not None:
                 logger.error(
@@ -1133,19 +1241,21 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         """
         if self._agsvpt_dual_cookie:
             # 双 Cookie 模式：用 WebUI 填写的 Cookie 构造伪 site 对象
+            # indexer 统一使用 agsvpt.com 的（两个域名结构相同，pt.agsvpt.cn 在MP中没有单独注册）
+            agsvpt_index = SitesHelper().get_indexer("agsvpt.com")
+
             results = []
-            for cookie, domain, label in [
-                (self._agsvpt_cookie_pt,  "pt.agsvpt.cn",  "pt.agsvpt.cn"),
-                (self._agsvpt_cookie_www, "agsvpt.com",    "www.agsvpt.com"),
+            for cookie, label in [
+                (self._agsvpt_cookie_pt,  "pt.agsvpt.cn"),
+                (self._agsvpt_cookie_www, "www.agsvpt.com"),
             ]:
                 if not cookie or not cookie.strip():
                     logger.debug(f"[AGSVPT] 双Cookie模式：{label} Cookie 未填写，跳过")
                     continue
-                index = SitesHelper().get_indexer(domain)
                 # 构造一个只含 cookie 属性的简单对象，供 __get_page_source 使用
                 class _FakeSite:
-                    def __init__(self, c): self.cookie = c; self.name = label
-                results.append((_FakeSite(cookie.strip()), index, label))
+                    def __init__(self, c, n): self.cookie = c; self.name = n
+                results.append((_FakeSite(cookie.strip(), label), agsvpt_index, label))
             if not results:
                 logger.warning("[AGSVPT] 双Cookie模式已开启但两个Cookie均未填写")
             return results
