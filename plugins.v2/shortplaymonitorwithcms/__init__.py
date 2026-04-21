@@ -68,7 +68,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png"
     # 插件版本
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -363,18 +363,26 @@ class ShortPlayMonitorWithCMS(_PluginBase):
 
     def __resolve_folder_name(self, title: str) -> str:
         """
-        文件夹名解析主逻辑（TMDB 优先，站点降级）：
+        文件夹名解析主逻辑：
 
-        1. 先向 TMDB 搜索（电视剧 → 电影）。
-           - 找到 → 按输出规则返回 "标题 (年份) {tmdb=XXXXX}"。
-        2. TMDB 未命中，且开启了站点降级（_site_fallback=True）：
-           - 检测 MP 是否已关联 AGSVPT（pt.agsvpt.cn / www.agsvpt.com）或 麒麟（ilolicon.com）。
-           - 已关联的站点按顺序搜索种子标题，取第一条种子标题作为 display_title，
-             年份从种子标题里用正则提取（格式常见如 2024），无 tmdb_id。
-           - 输出规则同上，但 tmdb_id 为 None，只有标题+年份（能提取时）。
-        3. 以上均失败 → 直接返回原始 title，整理流程不中断。
+        原则：文件夹名始终使用用户输入的中文 title，不使用 TMDB 返回的英文名。
+        TMDB 只用于补充 tmdb_id 和年份。
+        站点降级（AGSVPT/麒麟）只用于后续刮削 nfo/封面，不影响文件夹名。
+
+        输出规则：
+          - 找到 tmdb_id + 年份：  "中文title (年份) {tmdb=XXXXX}"
+          - 只找到 tmdb_id：       "中文title {tmdb=XXXXX}"
+          - 只找到年份：           "中文title (年份)"
+          - 完全找不到：           "中文title (年份)"  ← 年份从原始文件名提取
+          - 文件名也没年份：        "中文title"
         """
-        # ── Step 1: TMDB 查询 ───────────────────────────────────────────────
+        # ── 从原始文件名提取年份备用（如文件名含 2024/2025 等） ─────────────
+        year_from_filename = ""
+        year_match = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", title)
+        if year_match:
+            year_from_filename = year_match.group(1)
+
+        # ── Step 1: TMDB 查询，只取 tmdb_id 和年份，标题始终用原始中文 title ──
         try:
             logger.info(f"[文件夹名解析] TMDB 查询：{title}")
             best = None
@@ -404,40 +412,19 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                     or getattr(best, "release_date", None)
                     or ""
                 )
-                year = str(year_raw)[:4] if year_raw and len(str(year_raw)) >= 4 else ""
-                display_title = (
-                    getattr(best, "cn_name", None)
-                    or getattr(best, "title", None)
-                    or getattr(best, "name", None)
-                    or title
-                )
-                folder = self.__make_folder_name(display_title, year, tmdb_id)
-                logger.info(f"[文件夹名解析] TMDB {tmdb_type} 命中：[{title}] → [{folder}]")
+                year = str(year_raw)[:4] if year_raw and len(str(year_raw)) >= 4 else year_from_filename
+                # 文件夹名始终用原始中文 title，不用 TMDB 返回的英文/拼音名
+                folder = self.__make_folder_name(title, year, tmdb_id)
+                logger.info(f"[文件夹名解析] TMDB {tmdb_type} 命中 id={tmdb_id}：[{title}] → [{folder}]")
                 return folder
 
         except Exception as e:
             logger.error(f"[文件夹名解析] TMDB 查询异常：{title}，{e}", exc_info=True)
 
-        logger.warning(f"[文件夹名解析] TMDB 未命中：{title}")
-
-        # ── Step 2: 站点降级（可选） ────────────────────────────────────────
-        if self._site_fallback:
-            logger.info(f"[文件夹名解析] 尝试站点降级刮削：{title}")
-            site_title = self.__resolve_title_from_site(title)
-            if site_title:
-                # 从种子标题里尝试提取年份（常见格式：空格或括号包裹的4位年份）
-                year_match = re.search(r"[（(【\[\s]((?:19|20)\d{2})[）)】\]\s]", site_title)
-                year = year_match.group(1) if year_match else ""
-                # display_title 直接用站点种子标题（已是可读名称）
-                folder = self.__make_folder_name(site_title, year, None)
-                logger.info(f"[文件夹名解析] 站点降级命中：[{title}] → [{folder}]")
-                return folder
-            else:
-                logger.warning(f"[文件夹名解析] 站点降级未命中：{title}")
-
-        # ── Step 3: 全部失败，返回原始 title ────────────────────────────────
-        logger.warning(f"[文件夹名解析] 降级完毕仍未找到，使用原始标题：{title}")
-        return title
+        # ── Step 2: TMDB 未命中，用原始 title + 文件名年份组成文件夹名 ────────
+        # 站点降级（_site_fallback）只用于 nfo/封面刮削，不在此处影响文件夹名
+        logger.warning(f"[文件夹名解析] TMDB 未命中：{title}，使用原始标题+文件名年份")
+        return self.__make_folder_name(title, year_from_filename, None)
 
     def __resolve_title_from_site(self, title: str) -> Optional[str]:
         """
@@ -666,54 +653,38 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                     "target_path": str(target_path.parent / "tvshow.nfo"),
                                 })
 
-                    # 封面裁剪（持久开关 _image 控制，默认开启）
+                    # 封面获取（持久开关 _image 控制，默认开启）
+                    # 优先级：TMDB封面 → 站点封面(AGSVPT/麒麟) → ffmpeg截图兜底
                     if self._image:
-                        logger.debug(f"文件 {event_path} 生成缩略图开始")
                         if store_conf == "local":
-                            if not (target_path.parent / "poster.jpg").exists():
-                                thumb_path = self.gen_file_thumb(title=title,
-                                                                 rename_conf=rename_conf,
-                                                                 file_path=target_path)
-                                if thumb_path and Path(thumb_path).exists():
-                                    self.__save_poster(input_path=thumb_path,
-                                                       poster_path=target_path.parent / "poster.jpg",
-                                                       cover_conf=cover_conf)
-                                    if (target_path.parent / "poster.jpg").exists():
-                                        logger.info(f"{target_path.parent / 'poster.jpg'} 缩略图已生成")
-                                    thumb_path.unlink()
-                                else:
-                                    thumb_files = SystemUtils.list_files(
-                                        directory=target_path.parent, extensions=[".jpg"])
-                                    if thumb_files:
-                                        for thumb in thumb_files:
-                                            self.__save_poster(input_path=thumb,
-                                                               poster_path=target_path.parent / "poster.jpg",
-                                                               cover_conf=cover_conf)
-                                            break
-                                        for thumb in thumb_files:
-                                            Path(thumb).unlink()
+                            poster_path = target_path.parent / "poster.jpg"
+                            if not poster_path.exists():
+                                # poster 不存在：按优先级获取封面
+                                self.__fetch_poster(
+                                    title=title,
+                                    video_path=target_path,
+                                    poster_path=poster_path,
+                                    cover_conf=cover_conf
+                                )
                             else:
-                                # poster 已存在，重新裁剪
-                                self.__save_poster(input_path=target_path.parent / "poster.jpg",
-                                                   poster_path=target_path.parent / "poster.jpg",
-                                                   cover_conf=cover_conf)
-                                logger.info(f"{target_path.parent / 'poster.jpg'} 封面已重新裁剪")
+                                # poster 已存在：直接按比例重新裁剪，不重新下载
+                                self.__save_poster(
+                                    input_path=poster_path,
+                                    poster_path=poster_path,
+                                    cover_conf=cover_conf
+                                )
+                                logger.info(f"[封面] poster 已存在，重新裁剪：{poster_path}")
                         else:
-                            # 网盘模式：生成 poster 到本地临时目录，由批量上传时一并上传
+                            # 网盘模式：封面生成到本地临时目录，由批量上传时一并上传
                             tmp_poster = (Path("/tmp/shortplaymonitormod") /
                                           target_path.parent.relative_to(Path("/")) / "poster.jpg")
                             if not tmp_poster.exists():
-                                thumb_path = self.gen_file_thumb(
-                                    title=title, rename_conf=rename_conf,
-                                    file_path=Path(event_path),
-                                    to_thumb_path=tmp_poster.parent)
-                                if thumb_path and Path(thumb_path).exists():
-                                    self.__save_poster(input_path=thumb_path,
-                                                       poster_path=tmp_poster,
-                                                       cover_conf=cover_conf)
-                                    if tmp_poster.exists():
-                                        logger.info(f"[刮削] poster.jpg 已生成到临时目录：{tmp_poster}")
-                                    thumb_path.unlink()
+                                self.__fetch_poster(
+                                    title=title,
+                                    video_path=Path(event_path),
+                                    poster_path=tmp_poster,
+                                    cover_conf=cover_conf
+                                )
                             # 将 poster 加入上传队列（去重：按 event_path 字符串比对）
                             if tmp_poster.exists():
                                 poster_ep = str(tmp_poster)
@@ -724,7 +695,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                         "target_path": str(target_path.parent / "poster.jpg"),
                                     })
                     else:
-                        logger.debug(f"封面裁剪开关已关闭，跳过缩略图生成")
+                        logger.debug(f"[封面] 封面获取开关已关闭，跳过")
 
                     # 本地模式：整理成功后直接记入CMS通知队列
                     if store_conf == "local":
@@ -1292,6 +1263,74 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         else:
             page_source = ""
         return page_source
+
+    def __fetch_poster(self, title: str, video_path: Path, poster_path: Path, cover_conf: str):
+        """
+        统一封面获取逻辑，优先级：TMDB封面 → 站点封面(AGSVPT/麒麟) → ffmpeg截图兜底。
+        获取成功后直接裁剪保存到 poster_path。
+        返回 True 表示成功，False 表示失败。
+        """
+        poster_path = Path(poster_path)
+        poster_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # ── 1. 尝试从 TMDB 获取封面 ──────────────────────────────────────────
+        try:
+            best = None
+            for search_fn in [self.tmdbchain.search_tv, self.tmdbchain.search_movie]:
+                try:
+                    results = search_fn(title) or []
+                    if results:
+                        best = results[0]
+                        break
+                except Exception:
+                    pass
+            if best:
+                poster_url = (
+                    getattr(best, "poster_path", None)
+                    or getattr(best, "backdrop_path", None)
+                )
+                if poster_url:
+                    # TMDB 返回的是相对路径，拼完整 URL
+                    if not poster_url.startswith("http"):
+                        poster_url = f"https://image.tmdb.org/t/p/w500{poster_url}"
+                    tmp_img = poster_path.with_suffix(".tmdb_tmp.jpg")
+                    if self.__save_image(url=poster_url, file_path=tmp_img):
+                        self.__save_poster(input_path=tmp_img, poster_path=poster_path, cover_conf=cover_conf)
+                        tmp_img.unlink(missing_ok=True)
+                        if poster_path.exists():
+                            logger.info(f"[封面] TMDB 封面获取成功：{poster_path.name}")
+                            return True
+        except Exception as e:
+            logger.debug(f"[封面] TMDB 封面获取异常：{e}")
+
+        # ── 2. 尝试从站点获取封面（AGSVPT / 麒麟） ──────────────────────────
+        try:
+            tmp_site = poster_path.with_suffix(".site_tmp.jpg")
+            result = self.gen_file_thumb_from_site(title=title, file_path=tmp_site)
+            if result and Path(tmp_site).exists():
+                self.__save_poster(input_path=tmp_site, poster_path=poster_path, cover_conf=cover_conf)
+                tmp_site.unlink(missing_ok=True)
+                if poster_path.exists():
+                    logger.info(f"[封面] 站点封面获取成功：{poster_path.name}")
+                    return True
+        except Exception as e:
+            logger.debug(f"[封面] 站点封面获取异常：{e}")
+
+        # ── 3. ffmpeg 截图兜底 ────────────────────────────────────────────────
+        try:
+            tmp_thumb = poster_path.with_suffix(".ffmpeg_tmp.jpg")
+            self.get_thumb(video_path=str(video_path), image_path=str(tmp_thumb), frames=self._timeline)
+            if tmp_thumb.exists():
+                self.__save_poster(input_path=tmp_thumb, poster_path=poster_path, cover_conf=cover_conf)
+                tmp_thumb.unlink(missing_ok=True)
+                if poster_path.exists():
+                    logger.info(f"[封面] ffmpeg 截图兜底成功：{poster_path.name}")
+                    return True
+        except Exception as e:
+            logger.error(f"[封面] ffmpeg 截图失败：{e}", exc_info=True)
+
+        logger.error(f"[封面] 所有封面获取方式均失败：{title}")
+        return False
 
     def gen_file_thumb(self, title: str, file_path: Path, rename_conf: str, to_thumb_path: Path = None):
         if str(rename_conf) == "smart":
