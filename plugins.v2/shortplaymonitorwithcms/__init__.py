@@ -68,7 +68,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -97,6 +97,10 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     _notify = False
     _medias = {}
     filemanager = None
+
+    # ===== AGSVPT备用域名私有属性 =====
+    _agsvpt_use_pt = False      # 是否启用 pt.agsvpt.cn 替代 www.agsvpt.com
+    _agsvpt_cookie_pt = ""      # pt.agsvpt.cn 的 Cookie
 
     # ===== CMS通知私有属性 =====
     _cms_enabled = False
@@ -130,6 +134,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             self._monitor_confs = config.get("monitor_confs")
             self._exclude_keywords = config.get("exclude_keywords") or ""
             self._transfer_type = config.get("transfer_type") or "link"
+            # AGSVPT备用域名配置
+            self._agsvpt_use_pt = config.get("agsvpt_use_pt") or False
+            self._agsvpt_cookie_pt = config.get("agsvpt_cookie_pt") or ""
             # CMS通知配置
             self._cms_enabled = config.get("cms_enabled")
             self._cms_notify_type = config.get("cms_notify_type")
@@ -724,15 +731,31 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     def gen_file_thumb_from_site(self, title: str, file_path: Path):
         try:
             image = None
-            domain = "agsvpt.com"
-            site = SiteOper().get_by_domain(domain)
-            index = SitesHelper().get_indexer(domain)
-            if site:
-                req_url = (f"https://www.agsvpt.com/torrents.php?search_mode=0&search_area=0&page=0&notnewword=1&cat"
-                           f"=419&search={title}")
-                image_xpath = "//*[@id='kdescr']/img[1]/@src"
-                logger.info(f"开始检索 {site.name} {title}")
-                image = self.__get_site_torrents(url=req_url, site=site, index=index, image_xpath=image_xpath)
+            # 根据开关决定使用哪个 AGSVPT 域名和 Cookie
+            if self._agsvpt_use_pt and self._agsvpt_cookie_pt:
+                # 开关打开：使用 pt.agsvpt.cn + 自定义Cookie
+                agsvpt_url = (f"https://pt.agsvpt.cn/torrents.php?search_mode=0&search_area=0&page=0&notnewword=1&cat"
+                              f"=419&search={title}")
+                index = SitesHelper().get_indexer("agsvpt.com")
+
+                class _FakeSite:
+                    def __init__(self, cookie): self.cookie = cookie; self.name = "pt.agsvpt.cn"
+
+                site = _FakeSite(self._agsvpt_cookie_pt)
+                logger.info(f"开始检索 pt.agsvpt.cn（自定义Cookie）{title}")
+                image = self.__get_site_torrents(url=agsvpt_url, site=site, index=index,
+                                                 image_xpath="//*[@id='kdescr']/img[1]/@src")
+            else:
+                # 开关关闭：使用 MP 站点管理中配置的 agsvpt.com
+                domain = "agsvpt.com"
+                site = SiteOper().get_by_domain(domain)
+                index = SitesHelper().get_indexer(domain)
+                if site:
+                    agsvpt_url = (f"https://www.agsvpt.com/torrents.php?search_mode=0&search_area=0&page=0&notnewword=1&cat"
+                                  f"=419&search={title}")
+                    logger.info(f"开始检索 {site.name} {title}")
+                    image = self.__get_site_torrents(url=agsvpt_url, site=site, index=index,
+                                                     image_xpath="//*[@id='kdescr']/img[1]/@src")
             if not image:
                 domain = "ilolicon.com"
                 site = SiteOper().get_by_domain(domain)
@@ -756,15 +779,31 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     def gen_desc_from_site(self, title: str):
         try:
             desc = None
-            domain = "agsvpt.com"
-            site = SiteOper().get_by_domain(domain)
-            index = SitesHelper().get_indexer(domain)
-            if site:
-                req_url = (f"https://www.agsvpt.com/torrents.php?search_mode=0&search_area=0&page=0&notnewword=1&cat"
-                           f"=419&search={title}")
-                desc_xpath = "//*[@id='kdescr']/text()"
-                logger.info(f"开始检索 {site.name} {title}")
-                desc = self.__get_site_torrents(url=req_url, site=site, index=index, desc_xpath=desc_xpath)
+            # 根据开关决定使用哪个 AGSVPT 域名和 Cookie
+            if self._agsvpt_use_pt and self._agsvpt_cookie_pt:
+                # 开关打开：使用 pt.agsvpt.cn + 自定义Cookie
+                agsvpt_url = (f"https://pt.agsvpt.cn/torrents.php?search_mode=0&search_area=0&page=0&notnewword=1&cat"
+                              f"=419&search={title}")
+                index = SitesHelper().get_indexer("agsvpt.com")
+
+                class _FakeSite:
+                    def __init__(self, cookie): self.cookie = cookie; self.name = "pt.agsvpt.cn"
+
+                site = _FakeSite(self._agsvpt_cookie_pt)
+                logger.info(f"开始检索 pt.agsvpt.cn（自定义Cookie）{title}")
+                desc = self.__get_site_torrents(url=agsvpt_url, site=site, index=index,
+                                                desc_xpath="//*[@id='kdescr']/text()")
+            else:
+                # 开关关闭：使用 MP 站点管理中配置的 agsvpt.com
+                domain = "agsvpt.com"
+                site = SiteOper().get_by_domain(domain)
+                index = SitesHelper().get_indexer(domain)
+                if site:
+                    agsvpt_url = (f"https://www.agsvpt.com/torrents.php?search_mode=0&search_area=0&page=0&notnewword=1&cat"
+                                  f"=419&search={title}")
+                    logger.info(f"开始检索 {site.name} {title}")
+                    desc = self.__get_site_torrents(url=agsvpt_url, site=site, index=index,
+                                                    desc_xpath="//*[@id='kdescr']/text()")
             if not desc:
                 domain = "ilolicon.com"
                 site = SiteOper().get_by_domain(domain)
@@ -919,6 +958,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "cms_notify_type": self._cms_notify_type,
             "cms_domain": self._cms_domain,
             "cms_api_token": self._cms_api_token,
+            "agsvpt_use_pt": self._agsvpt_use_pt,
+            "agsvpt_cookie_pt": self._agsvpt_cookie_pt,
         })
 
     def get_state(self) -> bool:
@@ -1078,6 +1119,77 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             }
                         ]
                     },
+                    # ===== AGSVPT 备用域名配置区 =====
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '── AGSVPT 备用域名配置（可选） ──'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'agsvpt_use_pt',
+                                            'label': '启用 pt.agsvpt.cn',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 9},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'warning',
+                                            'variant': 'tonal',
+                                            'text': '开启后刮削时使用 pt.agsvpt.cn 替代 www.agsvpt.com，并使用下方填写的 Cookie，不再依赖 MP 站点管理中的 AGSVPT 配置。关闭则使用 MP 站点管理中配置的 www.agsvpt.com。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'agsvpt_cookie_pt',
+                                            'label': 'pt.agsvpt.cn Cookie',
+                                            'placeholder': '开启上方开关后在此填写 pt.agsvpt.cn 的 Cookie'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     # ===== 分隔线：CMS通知配置区 =====
                     {
                         'component': 'VRow',
@@ -1181,28 +1293,6 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                             'type': 'info',
                                             'variant': 'tonal',
                                             'text': (
-                                                '短剧监控说明：'
-                                                'https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/docs/ShortPlayMonitor.md'
-                                            )
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12},
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': (
                                                 'CMS通知说明：整理完成后会等待60秒静默期（期间无新文件）才通知CMS，'
                                                 '避免频繁触发。CMS版本需 ≥ 0.3.5.11：https://wiki.cmscc.cc'
                                             )
@@ -1231,6 +1321,78 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             }
                         ]
                     },
+                    # ===== 监控目录格式说明 =====
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '── 监控目录格式说明 ──'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'success',
+                                            'variant': 'tonal',
+                                            'text': '本地整理格式（可复制）：\ncompatibility#/短剧下载路径#/整理后短剧路径#smart#2:3\n\n示例：\ncompatibility#/media/downloads/shortplay#/media/library/shortplay#smart#2:3'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'success',
+                                            'variant': 'tonal',
+                                            'text': '网盘整理格式（可复制）：\ncompatibility#/短剧下载路径#/整理后短剧路径#smart#2:3#网盘存储类型\n\n示例：\ncompatibility#/media/downloads/shortplay#/媒体库/短剧#smart#2:3#u115'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'warning',
+                                            'variant': 'tonal',
+                                            'text': '参数说明：\n【监控方式】compatibility = 兼容模式（推荐，支持SMB/网络挂载目录）| fast = 快速模式（本地目录，性能更好但NAS无法休眠）\n【重命名方式】smart = 智能识别剧名（推荐，自动从文件名提取标题）| true = 启用自定义词识别 | false = 不重命名直接使用原始文件夹名\n【封面比例】2:3 = 竖版海报（推荐，宽:高=2:3）| 16:9 = 横版宽屏 | 1:1 = 正方形\n【网盘存储类型】u115 = 115网盘 | 115网盘Plus = 115网盘Plus | CloudDrive储存 = CloudDrive2挂载'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                 ]
             }
         ], {
@@ -1242,6 +1404,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "monitor_confs": "",
             "exclude_keywords": "",
             "transfer_type": "link",
+            "agsvpt_use_pt": False,
+            "agsvpt_cookie_pt": "",
             "cms_enabled": False,
             "cms_notify_type": "lift_sync",
             "cms_api_token": "cloud_media_sync",
