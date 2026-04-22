@@ -68,7 +68,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.0.7"
+    plugin_version = "1.0.8"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -453,7 +453,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
 
                 if retcode == 0:
                     if store_conf == "local":
-                        logger.info(f"文件 {event_path} 硬链接完成")
+                        transfer_desc = {"link": "硬链接", "move": "移动", "copy": "复制", "softlink": "软链接"}
+                        logger.info(f"文件 {event_path} {transfer_desc.get(self._transfer_type, self._transfer_type)}完成")
                     else:
                         logger.info(f"文件 {event_path} 上传完成")
 
@@ -863,7 +864,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             if not image:
                 logger.error(f"未获取到种子封面 {torrents[0].get('page_url')}")
                 return None
-            return str(image)
+            # xpath 返回列表，取第一个元素作为 URL 字符串
+            return image[0] if isinstance(image, list) else str(image)
         if desc_xpath:
             desc = html.xpath(desc_xpath)
             logger.debug(f"desc: {desc}")
