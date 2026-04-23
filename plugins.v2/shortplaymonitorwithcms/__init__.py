@@ -68,7 +68,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -499,16 +499,17 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             if not source_oper or not target_oper:
                                 return None, f"不支持的存储类型：{store_conf}"
 
+                            # nfo/poster 从本地临时目录上传到网盘必须用 copy
                             new_item, errmsg = TransHandler._TransHandler__transfer_command(
                                 fileitem=file_item,
                                 target_storage=store_conf,
                                 target_file=Path(target_path.parent / "tvshow.nfo"),
-                                transfer_type=self._transfer_type,
+                                transfer_type="copy",
                                 source_oper=source_oper, target_oper=target_oper)
                             if new_item:
-                                logger.debug(f"文件 {Path(target_path.parent / 'tvshow.nfo')} 整理完成")
+                                logger.info(f"[网盘] tvshow.nfo 上传成功：{target_path.parent / 'tvshow.nfo'}")
                             else:
-                                logger.debug((f"文件 {Path(target_path.parent / 'tvshow.nfo')} 整理失败:{errmsg}"))
+                                logger.error(f"[网盘] tvshow.nfo 上传失败：{errmsg}")
 
                     logger.debug(f"文件 {event_path} 生成缩略图开始")
                     if store_conf == "local":
@@ -568,15 +569,18 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                 target_oper = self.filemanager._FileManagerModule__get_storage_oper(store_conf)
                                 if not source_oper or not target_oper:
                                     return None, f"不支持的存储类型：{store_conf}"
+                                # nfo/poster 从本地临时目录上传到网盘必须用 copy
                                 new_item, errmsg = TransHandler._TransHandler__transfer_command(
                                     fileitem=file_item,
                                     target_storage=store_conf,
                                     target_file=Path(target_path.parent / "poster.jpg"),
-                                    transfer_type=self._transfer_type, source_oper=source_oper,
+                                    transfer_type="copy",
+                                    source_oper=source_oper,
                                     target_oper=target_oper)
                                 if new_item:
-                                    logger.debug(f"{target_path.parent / 'poster.jpg'} 缩略图已整理")
-                                logger.info(f"{target_path.parent / 'poster.jpg'} 缩略图已生成")
+                                    logger.info(f"[网盘] poster.jpg 上传成功：{target_path.parent / 'poster.jpg'}")
+                                else:
+                                    logger.error(f"[网盘] poster.jpg 上传失败：{errmsg}")
                                 thumb_path.unlink()
                 else:
                     logger.error(f"文件 {event_path} 硬链接失败，错误码：{retcode}")
@@ -910,7 +914,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                 return
             self.gen_file_thumb_from_site(title=title, file_path=thumb_path)
             if Path(thumb_path).exists():
-                logger.info(f"{file_path} 缩略图已生成：{thumb_path}")
+                logger.info(f"{file_path} 站点封面已下载：{thumb_path}")
                 return thumb_path
         with ffmpeg_lock:
             try:
@@ -925,7 +929,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                image_path=str(thumb_path),
                                frames=self._timeline)
                 if Path(thumb_path).exists():
-                    logger.info(f"{file_path} 缩略图已生成：{thumb_path}")
+                    logger.info(f"{file_path} ffmpeg截图已生成：{thumb_path}")
                     return thumb_path
             except Exception as err:
                 logger.error(f"FFmpeg处理文件 {file_path} 时发生错误：{str(err)}", exc_info=True)
