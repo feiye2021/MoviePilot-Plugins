@@ -68,7 +68,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.0.9"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -109,6 +109,13 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     _cms_api_token = None
     _last_event_time = 0
     _wait_notify_count = 0
+    # 每次CMS通知时记录本次涉及的剧集信息，用于通知完成后复制封面和发MP通知
+    # key=title, value={"files": [event_path,...], "target_dir": str}
+    _pending_after_cms: Dict[str, Dict] = {}
+
+    # ===== 封面图复制私有属性 =====
+    _poster_copy_enabled = False   # 是否在CMS完成后复制封面图到指定目录
+    _poster_copy_dest = ""         # 封面图复制的目标根目录
 
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
@@ -142,6 +149,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             self._cms_notify_type = config.get("cms_notify_type")
             self._cms_domain = config.get("cms_domain")
             self._cms_api_token = config.get("cms_api_token")
+            # 封面图复制配置
+            self._poster_copy_enabled = config.get("poster_copy_enabled") or False
+            self._poster_copy_dest = config.get("poster_copy_dest") or ""
 
         # 停止现有任务
         self.stop_service()
@@ -586,25 +596,25 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                     logger.error(f"文件 {event_path} 硬链接失败，错误码：{retcode}")
 
             if self._notify:
-                # 发送消息汇总
-                media_list = self._medias.get(title) or {}
-                if media_list:
-                    media_files = media_list.get("files") or []
-                    if media_files:
-                        if str(event_path) not in media_files:
-                            media_files.append(str(event_path))
-                    else:
-                        media_files = [str(event_path)]
-                    media_list = {
+                # 记录待通知信息
+                # 如果开启了CMS，通知时机推迟到 CMS完成+封面复制完成后
+                # 如果未开启CMS，直接写入 _medias，由 send_msg 定时发送
+                if self._cms_enabled:
+                    # 记录到 _pending_after_cms，CMS成功后再触发通知和封面复制
+                    pending = self._pending_after_cms.get(title) or {"files": [], "target_dir": str(target_path.parent)}
+                    if str(event_path) not in pending["files"]:
+                        pending["files"].append(str(event_path))
+                    self._pending_after_cms[title] = pending
+                else:
+                    # 未开启CMS：整理完即通知
+                    media_list = self._medias.get(title) or {}
+                    media_files = (media_list.get("files") or [])
+                    if str(event_path) not in media_files:
+                        media_files.append(str(event_path))
+                    self._medias[title] = {
                         "files": media_files,
                         "time": datetime.datetime.now()
                     }
-                else:
-                    media_list = {
-                        "files": [str(event_path)],
-                        "time": datetime.datetime.now()
-                    }
-                self._medias[title] = media_list
 
         except Exception as e:
             logger.error(f"event_handler_created error: {e}", exc_info=True)
@@ -644,9 +654,32 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     def __get_time(self):
         return int(time.time())
 
+    def __copy_poster_to_dest(self, title: str, target_dir: str):
+        """
+        CMS增量同步完成后，将目标目录下的 poster.jpg 复制到指定根目录下同名文件夹内。
+        例：target_dir=/cloud/媒体库/短剧/天机眼，poster_copy_dest=/data/posters
+        则复制到：/data/posters/天机眼/poster.jpg
+        """
+        if not self._poster_copy_enabled or not self._poster_copy_dest:
+            return
+        try:
+            poster_src = Path(target_dir) / "poster.jpg"
+            if not poster_src.exists():
+                logger.warning(f"[封面复制] 源封面不存在，跳过：{poster_src}")
+                return
+            # 目标文件夹名与剧集文件夹名相同
+            dest_dir = Path(self._poster_copy_dest) / Path(target_dir).name
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_poster = dest_dir / "poster.jpg"
+            shutil.copy2(str(poster_src), str(dest_poster))
+            logger.info(f"[封面复制] 成功：{poster_src} → {dest_poster}")
+        except Exception as e:
+            logger.error(f"[封面复制] 失败：{title}，{e}", exc_info=True)
+
     def __notify_cms(self):
         """
-        定时检查并通知CMS执行增量同步
+        定时检查并通知CMS执行增量同步。
+        成功后依次执行：封面图复制 → MP入库通知。
         每分钟触发一次，满足条件后才真正发出通知：
         - 队列超过1000个文件，立即通知；
         - 或队列非空且距最后一次整理事件已超过60秒（静默期），才通知。
@@ -660,6 +693,35 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                 if ret:
                     logger.info(f"通知CMS执行增量同步成功（共{self._wait_notify_count}个文件）")
                     self._wait_notify_count = 0
+
+                    # ── CMS成功后：等待60秒让CMS完成strm生成，再执行封面复制+通知 ──
+                    # 快照当前待处理列表，避免延时期间被新数据覆盖
+                    pending_snapshot = dict(self._pending_after_cms)
+                    self._pending_after_cms.clear()
+                    logger.info(f"[CMS] 等待60秒后执行封面复制和入库通知，涉及剧集：{list(pending_snapshot.keys())}")
+
+                    def _do_after_cms_delay(pending_data: dict):
+                        logger.info(f"[CMS延时] 开始执行封面复制和入库通知")
+                        for t, p in pending_data.items():
+                            try:
+                                # 1. 封面图复制到指定目录
+                                t_dir = p.get("target_dir", "")
+                                if t_dir:
+                                    self.__copy_poster_to_dest(title=t, target_dir=t_dir)
+                                # 2. 触发 MP 入库通知
+                                if self._notify:
+                                    media_files = p.get("files", [])
+                                    self._medias[t] = {
+                                        "files": media_files,
+                                        "time": datetime.datetime.now()
+                                    }
+                                    logger.info(f"[通知] 剧集「{t}」共{len(media_files)}集，已加入通知队列")
+                            except Exception as e:
+                                logger.error(f"[CMS延时] 处理剧集「{t}」异常：{e}", exc_info=True)
+
+                    import threading
+                    threading.Timer(60.0, _do_after_cms_delay, args=(pending_snapshot,)).start()
+
                 elif ret is not None:
                     logger.error(
                         f"通知CMS失败，状态码：{ret.status_code}，返回信息：{ret.text} {ret.reason}")
@@ -966,6 +1028,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "cms_api_token": self._cms_api_token,
             "agsvpt_use_pt": self._agsvpt_use_pt,
             "agsvpt_cookie_pt": self._agsvpt_cookie_pt,
+            "poster_copy_enabled": self._poster_copy_enabled,
+            "poster_copy_dest": self._poster_copy_dest,
         })
 
     def get_state(self) -> bool:
@@ -1196,6 +1260,77 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             }
                         ]
                     },
+                    # ===== 封面图复制配置区 =====
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '── CMS增量同步完成后封面复制（可选） ──'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'poster_copy_enabled',
+                                            'label': '启用封面图复制',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 9},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'poster_copy_dest',
+                                            'label': '封面图复制目标根目录',
+                                            'placeholder': '例：/data/posters，将在此目录下创建同名剧集文件夹并复制 poster.jpg'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'warning',
+                                            'variant': 'tonal',
+                                            'text': '开启后，CMS增量同步成功后会将整理目录下的 poster.jpg 复制到目标根目录下的同名文件夹内。MP入库通知也将在此步骤完成后才发出。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     # ===== 分隔线：CMS通知配置区 =====
                     {
                         'component': 'VRow',
@@ -1412,6 +1547,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "transfer_type": "link",
             "agsvpt_use_pt": False,
             "agsvpt_cookie_pt": "",
+            "poster_copy_enabled": False,
+            "poster_copy_dest": "",
             "cms_enabled": False,
             "cms_notify_type": "lift_sync",
             "cms_api_token": "cloud_media_sync",
