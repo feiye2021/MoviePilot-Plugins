@@ -69,7 +69,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -86,6 +86,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     _monitor_confs = None
     _onlyonce = False
     _image = False
+    _re_scrape = False   # 强制重新刮削（单次执行后自动关闭）
     _exclude_keywords = ""
     _transfer_type = "link"
     _observer = []
@@ -141,6 +142,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             self._enabled = config.get("enabled")
             self._onlyonce = config.get("onlyonce")
             self._image = config.get("image")
+            self._re_scrape = config.get("re_scrape") or False
             self._interval = config.get("interval")
             self._notify = config.get("notify")
             self._monitor_confs = config.get("monitor_confs")
@@ -266,6 +268,11 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             self.__update_config()
             self.__handle_image()
 
+        if self._re_scrape:
+            self._re_scrape = False
+            self.__update_config()
+            self.__handle_re_scrape()
+
     def sync_all(self):
         """
         立即运行一次，全量同步目录中所有文件
@@ -308,6 +315,121 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                 except Exception:
                     continue
         logger.info("全量裁剪封面完成！")
+
+    def __handle_re_scrape(self):
+        """
+        强制重新刮削：遍历所有目标目录下的剧集子文件夹，
+        对每个剧集文件夹重新生成 tvshow.nfo（含年份/类别/简介等）和 poster.jpg，
+        不移动/复制视频文件，不重新整理。
+        """
+        if not self._dirconf:
+            logger.error("[重新刮削] 未配置监控目录，停止")
+            return
+
+        logger.info("[重新刮削] 开始强制重新刮削所有已入库短剧...")
+        total = 0
+        success = 0
+
+        for source_dir, target_dir in self._dirconf.items():
+            cover_conf = self._coverconf.get(source_dir)
+            rename_conf = self._renameconf.get(source_dir)
+            target_path = Path(target_dir)
+
+            if not target_path.exists():
+                logger.warning(f"[重新刮削] 目标目录不存在，跳过：{target_dir}")
+                continue
+
+            # 遍历目标目录下的所有剧集子文件夹
+            for series_dir in sorted(target_path.iterdir()):
+                if not series_dir.is_dir():
+                    continue
+                total += 1
+                title = series_dir.name
+                logger.info(f"[重新刮削] 处理剧集：{title}")
+
+                try:
+                    # 1. 重新生成 tvshow.nfo（覆盖旧的）
+                    self.__gen_tv_nfo_file(dir_path=series_dir, title=title)
+
+                    # 2. 重新获取并生成 poster.jpg（覆盖旧的）
+                    # 找该文件夹下第一个视频文件用于 ffmpeg 兜底截图
+                    video_files = SystemUtils.list_files(series_dir, settings.RMT_MEDIAEXT)
+                    video_path = Path(video_files[0]) if video_files else None
+
+                    poster_path = series_dir / "poster.jpg"
+                    # 先删除旧封面，强制重新获取
+                    if poster_path.exists():
+                        poster_path.unlink()
+
+                    # 从站点/ffmpeg 重新获取封面
+                    if video_path:
+                        thumb_path = self.gen_file_thumb(
+                            title=title,
+                            rename_conf=rename_conf,
+                            file_path=video_path
+                        )
+                        if thumb_path and Path(thumb_path).exists():
+                            self.__save_poster(
+                                input_path=thumb_path,
+                                poster_path=poster_path,
+                                cover_conf=cover_conf
+                            )
+                            Path(thumb_path).unlink(missing_ok=True)
+                    else:
+                        # 没有视频文件，只尝试从站点下载封面
+                        tmp_thumb = series_dir / f"{title}-site.jpg"
+                        self.gen_file_thumb_from_site(title=title, file_path=tmp_thumb)
+                        if tmp_thumb.exists():
+                            self.__save_poster(
+                                input_path=tmp_thumb,
+                                poster_path=poster_path,
+                                cover_conf=cover_conf
+                            )
+                            tmp_thumb.unlink(missing_ok=True)
+
+                    if poster_path.exists():
+                        logger.info(f"[重新刮削] ✓ {title} 封面已更新")
+                    else:
+                        logger.warning(f"[重新刮削] ! {title} 封面获取失败")
+
+                    success += 1
+                except Exception as e:
+                    logger.error(f"[重新刮削] ✗ {title} 刮削异常：{e}", exc_info=True)
+
+        logger.info(f"[重新刮削] 完成！共处理 {total} 个剧集，成功 {success} 个")
+
+        if success == 0:
+            logger.warning("[重新刮削] 无成功刮削记录，跳过后续CMS通知和媒体库刷新")
+            return
+
+        # ── CMS 增量通知 ─────────────────────────────────────────────────
+        if self._cms_enabled and self._cms_domain and self._cms_api_token:
+            try:
+                url = (f"{self._cms_domain}/api/sync/lift_by_token"
+                       f"?token={self._cms_api_token}&type={self._cms_notify_type}")
+                ret = RequestUtils().get_res(url)
+                if ret:
+                    logger.info(f"[重新刮削] CMS增量同步通知成功")
+                elif ret is not None:
+                    logger.error(f"[重新刮削] CMS通知失败，状态码：{ret.status_code}，{ret.text}")
+                else:
+                    logger.error("[重新刮削] CMS通知失败，未获取到返回信息")
+            except Exception as e:
+                logger.error(f"[重新刮削] CMS通知异常：{e}", exc_info=True)
+        else:
+            logger.info("[重新刮削] 未启用CMS通知，跳过")
+
+        # ── 延时后刷新媒体库 ─────────────────────────────────────────────
+        if self._media_scan_enabled:
+            def _re_scrape_scan():
+                wait = 60 + 180  # CMS处理60秒 + 封面复制缓冲3分钟
+                logger.info(f"[重新刮削] 等待 {wait} 秒后触发媒体库扫描...")
+                time.sleep(wait)
+                self.__scan_mediaserver()
+                logger.info("[重新刮削] 媒体库扫描已触发")
+            threading.Thread(target=_re_scrape_scan, daemon=True).start()
+        else:
+            logger.info("[重新刮削] 未启用媒体库扫描，跳过")
 
     def event_handler(self, event, source_dir: str, event_path: str):
         """
@@ -848,21 +970,84 @@ class ShortPlayMonitorWithCMS(_PluginBase):
 
     def __gen_tv_nfo_file(self, dir_path: Path, title: str):
         logger.info(f"正在生成电视剧NFO文件：{dir_path.name}")
-        desc = self.gen_desc_from_site(title=title)
+
+        # 优先从站点获取结构化信息（年份/类别/简介/产地/语言）
+        info = self.gen_info_from_site(title=title)
+
         doc = minidom.Document()
         root = DomUtils.add_node(doc, doc, "tvshow")
         DomUtils.add_node(doc, root, "title", title)
         DomUtils.add_node(doc, root, "originaltitle", title)
         DomUtils.add_node(doc, root, "season", "-1")
         DomUtils.add_node(doc, root, "episode", "-1")
-        if desc:
-            DomUtils.add_node(doc, root, "plot", desc)
+
+        if info.get("year"):
+            DomUtils.add_node(doc, root, "year", info["year"])
+        if info.get("plot"):
+            DomUtils.add_node(doc, root, "plot", info["plot"])
+        if info.get("country"):
+            DomUtils.add_node(doc, root, "country", info["country"])
+        if info.get("language"):
+            DomUtils.add_node(doc, root, "language", info["language"])
+        for genre in info.get("genres", []):
+            DomUtils.add_node(doc, root, "genre", genre)
+
+        # 如果站点完全没找到，降级只用 gen_desc_from_site 取简介
+        if not info or not any([info.get("year"), info.get("plot"), info.get("genres")]):
+            logger.warning(f"[NFO] 站点结构化信息为空，尝试单独获取简介：{title}")
+            desc = self.gen_desc_from_site(title=title)
+            if desc:
+                # plot 节点可能已经写了空的，这里直接追加
+                DomUtils.add_node(doc, root, "plot", desc)
+
         self.__save_nfo(doc, dir_path.joinpath("tvshow.nfo"))
 
     def __save_nfo(self, doc, file_path: Path):
         xml_str = doc.toprettyxml(indent="  ", encoding="utf-8")
         file_path.write_bytes(xml_str)
         logger.info(f"NFO文件已保存：{file_path}")
+
+    def __parse_site_info(self, text_lines: list) -> dict:
+        """
+        解析 AGSVPT/麒麟 种子详情页的结构化文本，提取年份、类别、简介等字段。
+        格式：◎年　　代　2026 / ◎类　　别　都市 霸总 / ◎简　　介　...
+        返回字典：{year, genres, plot, country, language}
+        """
+        import re
+        result = {"year": "", "genres": [], "plot": "", "country": "", "language": ""}
+        if not text_lines:
+            return result
+
+        # 把列表拼成完整文本，方便正则匹配
+        full_text = "\n".join(text_lines)
+
+        # 字段映射：关键词 → result key
+        patterns = {
+            "year":     r"◎年[\s　]*代[\s　]*(.+)",
+            "country":  r"◎产[\s　]*地[\s　]*(.+)",
+            "language": r"◎语[\s　]*言[\s　]*(.+)",
+            "genres":   r"◎类[\s　]*别[\s　]*(.+)",
+        }
+        for key, pattern in patterns.items():
+            m = re.search(pattern, full_text)
+            if m:
+                val = m.group(1).strip()
+                if key == "genres":
+                    result[key] = [g.strip() for g in re.split(r"[\s　/|，,]+", val) if g.strip()]
+                elif key == "year":
+                    # 只取4位数字年份
+                    year_m = re.search(r"((?:19|20)\d{2})", val)
+                    result[key] = year_m.group(1) if year_m else val.strip()
+                else:
+                    result[key] = val
+
+        # 简介：◎简　　介 后面的所有文本（可能多行）
+        plot_m = re.search(r"◎简[\s　]*介[\s　]*(.+?)(?=◎|\Z)", full_text, re.DOTALL)
+        if plot_m:
+            result["plot"] = re.sub(r"\s+", " ", plot_m.group(1)).strip()
+
+        logger.debug(f"[NFO解析] 结果：year={result['year']} genres={result['genres']} country={result['country']}")
+        return result
 
     def gen_file_thumb_from_site(self, title: str, file_path: Path):
         try:
@@ -912,6 +1097,52 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             logger.error(f"检索站点 {title} 封面失败 {str(e)}", exc_info=True)
             return None
 
+    def gen_info_from_site(self, title: str) -> dict:
+        """
+        从 AGSVPT 或麒麟获取结构化信息（年份/类别/简介/产地/语言）。
+        返回解析后的 dict，字段：year / genres / plot / country / language。
+        """
+        # 取完整文本节点列表
+        text_lines = None
+
+        if self._agsvpt_use_pt and self._agsvpt_cookie_pt:
+            agsvpt_url = (f"https://pt.agsvpt.cn/torrents.php?search_mode=0&search_area=0&page=0&notnewword=1&cat"
+                          f"=419&search={title}")
+            index = SitesHelper().get_indexer("agsvpt.com")
+            class _FakeSite:
+                def __init__(self, cookie): self.cookie = cookie; self.name = "pt.agsvpt.cn"
+            site = _FakeSite(self._agsvpt_cookie_pt)
+            logger.info(f"[NFO] 检索 pt.agsvpt.cn 获取详细信息：{title}")
+            text_lines = self.__get_site_torrents(url=agsvpt_url, site=site, index=index,
+                                                   desc_xpath="//*[@id='kdescr']//text()")
+        else:
+            domain = "agsvpt.com"
+            site = SiteOper().get_by_domain(domain)
+            index = SitesHelper().get_indexer(domain)
+            if site:
+                agsvpt_url = (f"https://www.agsvpt.com/torrents.php?search_mode=0&search_area=0&page=0&notnewword=1&cat"
+                              f"=419&search={title}")
+                logger.info(f"[NFO] 检索 {site.name} 获取详细信息：{title}")
+                text_lines = self.__get_site_torrents(url=agsvpt_url, site=site, index=index,
+                                                       desc_xpath="//*[@id='kdescr']//text()")
+
+        if not text_lines and True:
+            # 降级到麒麟
+            ilolicon = SiteOper().get_by_domain("ilolicon.com")
+            ilolicon_index = SitesHelper().get_indexer("ilolicon.com")
+            if ilolicon:
+                req_url = (f"https://share.ilolicon.com/torrents.php?search_mode=0&search_area=0&page=0&notnewword"
+                           f"=1&cat=402&search={title}")
+                logger.info(f"[NFO] 检索 麒麟 获取详细信息：{title}")
+                text_lines = self.__get_site_torrents(url=req_url, site=ilolicon, index=ilolicon_index,
+                                                       desc_xpath="//*[@id='kdescr']//text()")
+
+        if isinstance(text_lines, list):
+            return self.__parse_site_info(text_lines)
+        elif isinstance(text_lines, str):
+            return self.__parse_site_info([text_lines])
+        return {}
+
     def gen_desc_from_site(self, title: str):
         try:
             desc = None
@@ -954,6 +1185,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                 logger.error(f"检索站点 {title} 简介失败")
                 return None
             else:
+                # __get_site_torrents 返回列表，取最后一个有内容的行作为简介
+                if isinstance(desc, list):
+                    return desc[-1] if desc else None
                 return desc
         except Exception as e:
             logger.error(f"检索站点 {title} 简介失败 {str(e)}", exc_info=True)
@@ -1004,11 +1238,12 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         if desc_xpath:
             desc = html.xpath(desc_xpath)
             logger.debug(f"desc: {desc}")
-            logger.debug(f"clean_text_list: {self.clean_text_list(desc)[-1]}")
             if not desc:
                 logger.error(f"未获取到种子简介 {torrents[0].get('page_url')}")
                 return None
-            return self.clean_text_list(desc)[-1]
+            cleaned = self.clean_text_list(desc)
+            # 返回完整列表，调用方自行决定取全部还是取最后一行
+            return cleaned
 
     def __get_page_source(self, url: str, site):
         ret = RequestUtils(
@@ -1090,6 +1325,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "interval": self._interval,
             "notify": self._notify,
             "image": self._image,
+            "re_scrape": self._re_scrape,
             "monitor_confs": self._monitor_confs,
             "cms_enabled": self._cms_enabled,
             "cms_notify_type": self._cms_notify_type,
@@ -1126,7 +1362,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 2},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
@@ -1139,7 +1375,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 2},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
@@ -1152,7 +1388,20 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 're_scrape',
+                                            'label': '强制重新刮削',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
@@ -1165,7 +1414,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 3},
+                                'props': {'cols': 12, 'md': 2},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
@@ -1641,6 +1890,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         ], {
             "enabled": False,
             "onlyonce": False,
+            "re_scrape": False,
             "image": False,
             "notify": False,
             "interval": 10,
