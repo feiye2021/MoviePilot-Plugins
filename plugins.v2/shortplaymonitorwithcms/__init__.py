@@ -24,6 +24,7 @@ from watchdog.observers.polling import PollingObserver
 
 from app.chain.media import MediaChain
 from app.chain.tmdb import TmdbChain
+from app.helper.mediaserver import MediaServerHelper
 from app.core.config import settings
 from app.core.meta.words import WordsMatcher
 from app.core.metainfo import MetaInfoPath
@@ -68,7 +69,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -117,6 +118,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     _poster_copy_enabled = False   # 是否在CMS完成后复制封面图到指定目录
     _poster_copy_dest = ""         # 封面图复制的目标根目录
 
+    # ===== 媒体库扫描私有属性 =====
+    _media_scan_enabled = False    # CMS完成后（或封面复制完成后）是否触发媒体库扫描
+
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
 
@@ -128,6 +132,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         self._storeconf = {}
         self.tmdbchain = TmdbChain()
         self.mediachain = MediaChain()
+        self.mediaserver_helper = MediaServerHelper()
         self.filemanager = FileManagerModule()
         self.filemanager.init_module()
 
@@ -152,6 +157,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             # 封面图复制配置
             self._poster_copy_enabled = config.get("poster_copy_enabled") or False
             self._poster_copy_dest = config.get("poster_copy_dest") or ""
+            # 媒体库扫描配置
+            self._media_scan_enabled = config.get("media_scan_enabled") or False
 
         # 停止现有任务
         self.stop_service()
@@ -654,6 +661,60 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     def __get_time(self):
         return int(time.time())
 
+    def __scan_mediaserver(self):
+        """
+        触发 MP 中已配置的媒体服务器（Emby/Jellyfin/Plex）执行全库扫描。
+        逐个遍历已配置的媒体服务器，调用各自的 Library/Refresh 接口。
+        """
+        if not self._media_scan_enabled:
+            return
+        try:
+            # 获取所有已配置的媒体服务器
+            servers = self.mediaserver_helper.get_services()
+            if not servers:
+                logger.warning("[媒体库扫描] MP 中未配置任何媒体服务器，跳过扫描")
+                return
+
+            for server_name, server in servers.items():
+                try:
+                    instance = server.instance
+                    config = server.config.config
+                    host = config.get("host", "")
+                    apikey = config.get("apikey", "")
+                    if not host or not apikey:
+                        logger.warning(f"[媒体库扫描] {server_name} 配置不完整，跳过")
+                        continue
+                    if not host.endswith("/"):
+                        host += "/"
+                    if not host.startswith("http"):
+                        host = "http://" + host
+
+                    # Emby / Jellyfin 都支持 /Library/Refresh 触发全库扫描
+                    server_type = str(type(instance).__name__).lower()
+                    if "emby" in server_type or "jellyfin" in server_type:
+                        req_url = f"{host}emby/Library/Refresh?api_key={apikey}"
+                        ret = RequestUtils().post_res(req_url)
+                        if ret:
+                            logger.info(f"[媒体库扫描] {server_name} 扫描已触发")
+                        else:
+                            logger.error(f"[媒体库扫描] {server_name} 扫描触发失败")
+                    elif "plex" in server_type:
+                        # Plex 用 /library/sections/all/refresh
+                        token = config.get("token", "")
+                        if token:
+                            req_url = f"{host}library/sections/all/refresh?X-Plex-Token={token}"
+                            ret = RequestUtils().get_res(req_url)
+                            if ret:
+                                logger.info(f"[媒体库扫描] {server_name}（Plex）扫描已触发")
+                            else:
+                                logger.error(f"[媒体库扫描] {server_name}（Plex）扫描触发失败")
+                    else:
+                        logger.warning(f"[媒体库扫描] {server_name} 类型未知（{server_type}），跳过")
+                except Exception as e:
+                    logger.error(f"[媒体库扫描] {server_name} 触发异常：{e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"[媒体库扫描] 获取媒体服务器异常：{e}", exc_info=True)
+
     def __copy_poster_to_dest(self, title: str, target_dir: str):
         """
         CMS增量同步完成后，将目标目录下的 poster.jpg 复制到指定根目录下同名文件夹内。
@@ -704,7 +765,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                         logger.info(f"[CMS延时] 开始执行封面复制和入库通知")
                         for t, p in pending_data.items():
                             try:
-                                # 1. 封面图复制到指定目录
+                                # 1. 封面图复制到指定目录（如已开启）
                                 t_dir = p.get("target_dir", "")
                                 if t_dir:
                                     self.__copy_poster_to_dest(title=t, target_dir=t_dir)
@@ -718,6 +779,14 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                     logger.info(f"[通知] 剧集「{t}」共{len(media_files)}集，已加入通知队列")
                             except Exception as e:
                                 logger.error(f"[CMS延时] 处理剧集「{t}」异常：{e}", exc_info=True)
+                        # 3. 所有剧集处理完后触发媒体库扫描
+                        #    未开封面复制：CMS完成后扫描
+                        #    开了封面复制：封面复制完成后等待3分钟再扫描
+                        if self._media_scan_enabled:
+                            if self._poster_copy_enabled:
+                                logger.info("[媒体库扫描] 封面复制完成，等待3分钟后触发媒体库扫描...")
+                                time.sleep(180)
+                            self.__scan_mediaserver()
 
                     import threading
                     threading.Timer(60.0, _do_after_cms_delay, args=(pending_snapshot,)).start()
@@ -1030,6 +1099,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "agsvpt_cookie_pt": self._agsvpt_cookie_pt,
             "poster_copy_enabled": self._poster_copy_enabled,
             "poster_copy_dest": self._poster_copy_dest,
+            "media_scan_enabled": self._media_scan_enabled,
         })
 
     def get_state(self) -> bool:
@@ -1331,6 +1401,38 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             }
                         ]
                     },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'media_scan_enabled',
+                                            'label': '完成后扫描媒体库',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 9},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '开启后，在封面图复制完成后（未开封面复制则在CMS增量完成后）自动触发 MP 中已配置的媒体服务器（Emby/Jellyfin/Plex）执行全库扫描。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     # ===== 分隔线：CMS通知配置区 =====
                     {
                         'component': 'VRow',
@@ -1549,6 +1651,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "agsvpt_cookie_pt": "",
             "poster_copy_enabled": False,
             "poster_copy_dest": "",
+            "media_scan_enabled": False,
             "cms_enabled": False,
             "cms_notify_type": "lift_sync",
             "cms_api_token": "cloud_media_sync",
