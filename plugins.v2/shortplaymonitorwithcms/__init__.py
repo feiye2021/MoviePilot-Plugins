@@ -69,7 +69,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.5"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -445,7 +445,10 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                         self.__copy_nfo_to_dest(title=t, target_dir=str(series_dir))
                 # 媒体库扫描
                 self.__scan_mediaserver()
-                logger.info("[重新刮削] 封面/NFO复制和媒体库扫描已完成")
+                # 如果开启了NFO复制，媒体库扫描后立即刷新元数据
+                if self._nfo_copy_enabled:
+                    self.__refresh_metadata()
+                logger.info("[重新刮削] 封面/NFO复制、媒体库扫描和元数据刷新已完成")
             threading.Thread(target=_re_scrape_after, daemon=True).start()
         else:
             logger.info("[重新刮削] 未启用封面复制/NFO复制/媒体库扫描，跳过")
@@ -856,6 +859,55 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         except Exception as e:
             logger.error(f"[媒体库扫描] 获取媒体服务器异常：{e}", exc_info=True)
 
+    def __refresh_metadata(self):
+        """
+        触发 Emby/Jellyfin 执行全库元数据刷新。
+        仅在 nfo_copy_enabled 开启时调用，刷新媒体库后再刷新元数据，
+        确保 NFO 文件内容被 Emby 正确读取。
+        Emby API：POST /emby/Items/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh
+        """
+        if not self._nfo_copy_enabled:
+            return
+        try:
+            servers = self.mediaserver_helper.get_services()
+            if not servers:
+                logger.warning("[元数据刷新] MP 中未配置任何媒体服务器，跳过")
+                return
+
+            for server_name, server in servers.items():
+                try:
+                    instance = server.instance
+                    config = server.config.config
+                    host = config.get("host", "")
+                    apikey = config.get("apikey", "")
+                    if not host or not apikey:
+                        continue
+                    if not host.endswith("/"):
+                        host += "/"
+                    if not host.startswith("http"):
+                        host = "http://" + host
+
+                    server_type = str(type(instance).__name__).lower()
+                    if "emby" in server_type or "jellyfin" in server_type:
+                        req_url = (
+                            f"{host}emby/Items/Refresh"
+                            f"?Recursive=true"
+                            f"&MetadataRefreshMode=FullRefresh"
+                            f"&ImageRefreshMode=FullRefresh"
+                            f"&api_key={apikey}"
+                        )
+                        ret = RequestUtils().post_res(req_url)
+                        if ret:
+                            logger.info(f"[元数据刷新] {server_name} 元数据刷新已触发")
+                        else:
+                            logger.error(f"[元数据刷新] {server_name} 元数据刷新触发失败")
+                    else:
+                        logger.debug(f"[元数据刷新] {server_name} 非Emby/Jellyfin，跳过元数据刷新")
+                except Exception as e:
+                    logger.error(f"[元数据刷新] {server_name} 异常：{e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"[元数据刷新] 获取媒体服务器异常：{e}", exc_info=True)
+
     def __copy_poster_to_dest(self, title: str, target_dir: str):
         """
         CMS增量同步完成后，将目标目录下的 poster.jpg 复制到指定根目录下同名文件夹内。
@@ -947,7 +999,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                     logger.info(f"[通知] 剧集「{t}」共{len(media_files)}集，已加入通知队列")
                             except Exception as e:
                                 logger.error(f"[CMS延时] 处理剧集「{t}」异常：{e}", exc_info=True)
-                        # 3. 所有剧集处理完后触发媒体库扫描
+                        # 3. 所有剧集处理完后触发媒体库扫描，NFO复制后再刷新元数据
                         #    未开封面复制：CMS完成后扫描
                         #    开了封面复制：封面复制完成后等待3分钟再扫描
                         if self._media_scan_enabled:
@@ -955,6 +1007,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                 logger.info("[媒体库扫描] 封面复制完成，等待3分钟后触发媒体库扫描...")
                                 time.sleep(180)
                             self.__scan_mediaserver()
+                        # 4. 如果开启了NFO复制，媒体库扫描后立即刷新元数据
+                        if self._nfo_copy_enabled:
+                            self.__refresh_metadata()
 
                     import threading
                     threading.Timer(60.0, _do_after_cms_delay, args=(pending_snapshot,)).start()
