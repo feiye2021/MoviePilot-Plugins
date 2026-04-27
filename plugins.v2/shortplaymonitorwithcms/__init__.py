@@ -69,7 +69,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -971,36 +971,63 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     def __gen_tv_nfo_file(self, dir_path: Path, title: str):
         logger.info(f"正在生成电视剧NFO文件：{dir_path.name}")
 
-        # 优先从站点获取结构化信息（年份/类别/简介/产地/语言）
+        # 从站点获取结构化信息（年份/类别/简介/产地/语言）
         info = self.gen_info_from_site(title=title)
+        plot = info.get("plot", "") or ""
+        year = info.get("year", "") or ""
+        genres = info.get("genres", []) or []
+        country = info.get("country", "") or ""
+        language = info.get("language", "") or ""
 
-        doc = minidom.Document()
-        root = DomUtils.add_node(doc, doc, "tvshow")
-        DomUtils.add_node(doc, root, "title", title)
-        DomUtils.add_node(doc, root, "originaltitle", title)
-        DomUtils.add_node(doc, root, "season", "-1")
-        DomUtils.add_node(doc, root, "episode", "-1")
+        # 站点完全没找到简介时，降级单独取
+        if not plot:
+            logger.warning(f"[NFO] 站点结构化信息无简介，尝试单独获取：{title}")
+            plot = self.gen_desc_from_site(title=title) or ""
 
-        if info.get("year"):
-            DomUtils.add_node(doc, root, "year", info["year"])
-        if info.get("plot"):
-            DomUtils.add_node(doc, root, "plot", info["plot"])
-        if info.get("country"):
-            DomUtils.add_node(doc, root, "country", info["country"])
-        if info.get("language"):
-            DomUtils.add_node(doc, root, "language", info["language"])
-        for genre in info.get("genres", []):
-            DomUtils.add_node(doc, root, "genre", genre)
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        premiered = year + "-01-01" if year else ""
 
-        # 如果站点完全没找到，降级只用 gen_desc_from_site 取简介
-        if not info or not any([info.get("year"), info.get("plot"), info.get("genres")]):
-            logger.warning(f"[NFO] 站点结构化信息为空，尝试单独获取简介：{title}")
-            desc = self.gen_desc_from_site(title=title)
-            if desc:
-                # plot 节点可能已经写了空的，这里直接追加
-                DomUtils.add_node(doc, root, "plot", desc)
+        # plot/outline 用 CDATA 包裹，避免中文特殊字符被转义
+        plot_cdata = "<![CDATA[" + plot + "]]>" if plot else ""
 
-        self.__save_nfo(doc, dir_path.joinpath("tvshow.nfo"))
+        # 按 Emby 识别的字段顺序逐行构建，完全对齐叵测.nfo格式
+        lines = [
+            '<?xml version="1.0" encoding="utf-8" standalone="yes"?>',
+            "<tvshow>",
+            "  <plot>" + plot_cdata + "</plot>",
+            "  <outline>" + plot_cdata + "</outline>",
+            "  <lockdata>false</lockdata>",
+            "  <dateadded>" + now_str + "</dateadded>",
+            "  <title>" + title + "</title>",
+            "  <originaltitle>" + title + "</originaltitle>",
+            "  <sorttitle>" + title + "</sorttitle>",
+        ]
+        if year:
+            lines.append("  <year>" + year + "</year>")
+        if premiered:
+            lines.append("  <premiered>" + premiered + "</premiered>")
+            lines.append("  <releasedate>" + premiered + "</releasedate>")
+        if country:
+            lines.append("  <country>" + country + "</country>")
+        if language:
+            lines.append("  <language>" + language + "</language>")
+        for genre in genres:
+            lines.append("  <genre>" + genre + "</genre>")
+        lines += [
+            "  <season>-1</season>",
+            "  <episode>-1</episode>",
+            "  <displayorder>aired</displayorder>",
+            "  <status>Continuing</status>",
+            "</tvshow>",
+        ]
+
+        nfo_content = "\n".join(lines)
+        nfo_path = dir_path / "tvshow.nfo"
+        nfo_path.write_text(nfo_content, encoding="utf-8")
+        logger.info(
+            f"NFO文件已保存：{nfo_path}"
+            f"（year={year}, genres={genres}, plot={'有' if plot else '无'}）"
+        )
 
     def __save_nfo(self, doc, file_path: Path):
         xml_str = doc.toprettyxml(indent="  ", encoding="utf-8")
