@@ -69,7 +69,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -119,6 +119,10 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     _poster_copy_enabled = False   # 是否在CMS完成后复制封面图到指定目录
     _poster_copy_dest = ""         # 封面图复制的目标根目录
 
+    # ===== NFO文件复制私有属性 =====
+    _nfo_copy_enabled = False      # 是否在封面图复制完成后同步复制 tvshow.nfo
+    _nfo_copy_dest = ""            # nfo 复制的目标根目录（留空则与封面图共用同一目录）
+
     # ===== 媒体库扫描私有属性 =====
     _media_scan_enabled = False    # CMS完成后（或封面复制完成后）是否触发媒体库扫描
 
@@ -159,6 +163,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             # 封面图复制配置
             self._poster_copy_enabled = config.get("poster_copy_enabled") or False
             self._poster_copy_dest = config.get("poster_copy_dest") or ""
+            # NFO文件复制配置
+            self._nfo_copy_enabled = config.get("nfo_copy_enabled") or False
+            self._nfo_copy_dest = config.get("nfo_copy_dest") or ""
             # 媒体库扫描配置
             self._media_scan_enabled = config.get("media_scan_enabled") or False
 
@@ -419,17 +426,29 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         else:
             logger.info("[重新刮削] 未启用CMS通知，跳过")
 
-        # ── 延时后刷新媒体库 ─────────────────────────────────────────────
-        if self._media_scan_enabled:
-            def _re_scrape_scan():
+        # ── 延时后：封面+NFO复制 → 媒体库刷新 ───────────────────────────
+        if self._media_scan_enabled or self._poster_copy_enabled or self._nfo_copy_enabled:
+            def _re_scrape_after(dirconf=dict(self._dirconf)):
                 wait = 60 + 180  # CMS处理60秒 + 封面复制缓冲3分钟
-                logger.info(f"[重新刮削] 等待 {wait} 秒后触发媒体库扫描...")
+                logger.info(f"[重新刮削] 等待 {wait} 秒后执行封面/NFO复制和媒体库扫描...")
                 time.sleep(wait)
+                # 遍历所有目标目录，逐剧集复制封面和 NFO
+                for _, target_dir in dirconf.items():
+                    target_path = Path(target_dir)
+                    if not target_path.exists():
+                        continue
+                    for series_dir in sorted(target_path.iterdir()):
+                        if not series_dir.is_dir():
+                            continue
+                        t = series_dir.name
+                        self.__copy_poster_to_dest(title=t, target_dir=str(series_dir))
+                        self.__copy_nfo_to_dest(title=t, target_dir=str(series_dir))
+                # 媒体库扫描
                 self.__scan_mediaserver()
-                logger.info("[重新刮削] 媒体库扫描已触发")
-            threading.Thread(target=_re_scrape_scan, daemon=True).start()
+                logger.info("[重新刮削] 封面/NFO复制和媒体库扫描已完成")
+            threading.Thread(target=_re_scrape_after, daemon=True).start()
         else:
-            logger.info("[重新刮削] 未启用媒体库扫描，跳过")
+            logger.info("[重新刮削] 未启用封面复制/NFO复制/媒体库扫描，跳过")
 
     def event_handler(self, event, source_dir: str, event_path: str):
         """
@@ -859,6 +878,31 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         except Exception as e:
             logger.error(f"[封面复制] 失败：{title}，{e}", exc_info=True)
 
+    def __copy_nfo_to_dest(self, title: str, target_dir: str):
+        """
+        封面图复制完成后，将目标目录下的 tvshow.nfo 复制到指定根目录下同名文件夹内。
+        目标路径规则与封面图相同：nfo_copy_dest（留空则复用 poster_copy_dest）/ 剧集同名文件夹 / tvshow.nfo
+        """
+        if not self._nfo_copy_enabled:
+            return
+        # 目标根目录：优先用 nfo_copy_dest，留空则复用 poster_copy_dest
+        dest_root = self._nfo_copy_dest or self._poster_copy_dest
+        if not dest_root:
+            logger.warning(f"[NFO复制] 未配置目标目录，跳过：{title}")
+            return
+        try:
+            nfo_src = Path(target_dir) / "tvshow.nfo"
+            if not nfo_src.exists():
+                logger.warning(f"[NFO复制] 源NFO不存在，跳过：{nfo_src}")
+                return
+            dest_dir = Path(dest_root) / Path(target_dir).name
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_nfo = dest_dir / "tvshow.nfo"
+            shutil.copy2(str(nfo_src), str(dest_nfo))
+            logger.info(f"[NFO复制] 成功：{nfo_src} → {dest_nfo}")
+        except Exception as e:
+            logger.error(f"[NFO复制] 失败：{title}，{e}", exc_info=True)
+
     def __notify_cms(self):
         """
         定时检查并通知CMS执行增量同步。
@@ -891,6 +935,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                 t_dir = p.get("target_dir", "")
                                 if t_dir:
                                     self.__copy_poster_to_dest(title=t, target_dir=t_dir)
+                                    # 封面复制完成后，同步复制 NFO（如已开启）
+                                    self.__copy_nfo_to_dest(title=t, target_dir=t_dir)
                                 # 2. 触发 MP 入库通知
                                 if self._notify:
                                     media_files = p.get("files", [])
@@ -1362,6 +1408,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "agsvpt_cookie_pt": self._agsvpt_cookie_pt,
             "poster_copy_enabled": self._poster_copy_enabled,
             "poster_copy_dest": self._poster_copy_dest,
+            "nfo_copy_enabled": self._nfo_copy_enabled,
+            "nfo_copy_dest": self._nfo_copy_dest,
             "media_scan_enabled": self._media_scan_enabled,
         })
 
@@ -1687,6 +1735,57 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                                     {
                                         'component': 'VSwitch',
                                         'props': {
+                                            'model': 'nfo_copy_enabled',
+                                            'label': '启用NFO文件复制',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 9},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'nfo_copy_dest',
+                                            'label': 'NFO复制目标根目录（留空则与封面图目录相同）',
+                                            'placeholder': '留空则复用封面图复制目录，或填写独立路径如 /data/nfo'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'warning',
+                                            'variant': 'tonal',
+                                            'text': '开启后，封面图复制完成后会将 tvshow.nfo 同步复制到目标根目录下的同名文件夹内。目标路径留空则与封面图使用相同目录。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
                                             'model': 'media_scan_enabled',
                                             'label': '完成后扫描媒体库',
                                         }
@@ -1928,6 +2027,8 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "agsvpt_cookie_pt": "",
             "poster_copy_enabled": False,
             "poster_copy_dest": "",
+            "nfo_copy_enabled": False,
+            "nfo_copy_dest": "",
             "media_scan_enabled": False,
             "cms_enabled": False,
             "cms_notify_type": "lift_sync",
