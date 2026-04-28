@@ -69,7 +69,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.1.5"
+    plugin_version = "1.1.6"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -125,6 +125,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
 
     # ===== 媒体库扫描私有属性 =====
     _media_scan_enabled = False    # CMS完成后（或封面复制完成后）是否触发媒体库扫描
+    _emby_library_id = ""          # 指定媒体库ItemId，留空则扫描/刷新全部媒体库
 
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
@@ -168,6 +169,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             self._nfo_copy_dest = config.get("nfo_copy_dest") or ""
             # 媒体库扫描配置
             self._media_scan_enabled = config.get("media_scan_enabled") or False
+            self._emby_library_id = config.get("emby_library_id") or ""
 
         # 停止现有任务
         self.stop_service()
@@ -805,15 +807,38 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     def __get_time(self):
         return int(time.time())
 
+    def __get_emby_conn(self, server):
+        """
+        从 server 对象提取标准连接信息，返回 (host, apikey, user_id) 或 None。
+        host 已保证以 / 结尾且带 http。
+        """
+        try:
+            config = server.config.config
+            host = config.get("host", "")
+            apikey = config.get("apikey", "")
+            if not host or not apikey:
+                return None
+            if not host.endswith("/"):
+                host += "/"
+            if not host.startswith("http"):
+                host = "http://" + host
+            # 获取当前用户 ID（参考 EmbyMetaRefresh 插件做法）
+            user_id = server.instance.get_user() if hasattr(server.instance, "get_user") else ""
+            return host, apikey, user_id
+        except Exception as e:
+            logger.error(f"[Emby连接] 提取连接信息异常：{e}")
+            return None
+
     def __scan_mediaserver(self):
         """
-        触发 MP 中已配置的媒体服务器（Emby/Jellyfin/Plex）执行全库扫描。
-        逐个遍历已配置的媒体服务器，调用各自的 Library/Refresh 接口。
+        触发媒体服务器扫描媒体库。
+        - 填写了 _emby_library_id：仅扫描指定库（GET /emby/Items/{id}/Refresh）
+        - 未填写：全库扫描（GET /emby/Library/Refresh）
+        Plex 固定全库扫描，不支持按库 ID 扫描。
         """
         if not self._media_scan_enabled:
             return
         try:
-            # 获取所有已配置的媒体服务器
             servers = self.mediaserver_helper.get_services()
             if not servers:
                 logger.warning("[媒体库扫描] MP 中未配置任何媒体服务器，跳过扫描")
@@ -821,30 +846,33 @@ class ShortPlayMonitorWithCMS(_PluginBase):
 
             for server_name, server in servers.items():
                 try:
-                    instance = server.instance
-                    config = server.config.config
-                    host = config.get("host", "")
-                    apikey = config.get("apikey", "")
-                    if not host or not apikey:
+                    conn = self.__get_emby_conn(server)
+                    if not conn:
                         logger.warning(f"[媒体库扫描] {server_name} 配置不完整，跳过")
                         continue
-                    if not host.endswith("/"):
-                        host += "/"
-                    if not host.startswith("http"):
-                        host = "http://" + host
+                    host, apikey, _ = conn
+                    server_type = str(type(server.instance).__name__).lower()
 
-                    # Emby / Jellyfin 都支持 /Library/Refresh 触发全库扫描
-                    server_type = str(type(instance).__name__).lower()
                     if "emby" in server_type or "jellyfin" in server_type:
-                        req_url = f"{host}emby/Library/Refresh?api_key={apikey}"
+                        if self._emby_library_id:
+                            # 指定库：用 Items/{library_id}/Refresh 触发该库扫描
+                            req_url = (
+                                f"{host}emby/Items/{self._emby_library_id}/Refresh"
+                                f"?Recursive=true&api_key={apikey}"
+                            )
+                            logger.info(f"[媒体库扫描] {server_name} 扫描指定库 {self._emby_library_id}")
+                        else:
+                            # 全库扫描
+                            req_url = f"{host}emby/Library/Refresh?api_key={apikey}"
+                            logger.info(f"[媒体库扫描] {server_name} 全库扫描")
                         ret = RequestUtils().post_res(req_url)
                         if ret:
                             logger.info(f"[媒体库扫描] {server_name} 扫描已触发")
                         else:
                             logger.error(f"[媒体库扫描] {server_name} 扫描触发失败")
+
                     elif "plex" in server_type:
-                        # Plex 用 /library/sections/all/refresh
-                        token = config.get("token", "")
+                        token = server.config.config.get("token", "")
                         if token:
                             req_url = f"{host}library/sections/all/refresh?X-Plex-Token={token}"
                             ret = RequestUtils().get_res(req_url)
@@ -861,10 +889,16 @@ class ShortPlayMonitorWithCMS(_PluginBase):
 
     def __refresh_metadata(self):
         """
-        触发 Emby/Jellyfin 执行全库元数据刷新。
-        仅在 nfo_copy_enabled 开启时调用，刷新媒体库后再刷新元数据，
-        确保 NFO 文件内容被 Emby 正确读取。
-        Emby API：POST /emby/Items/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh
+        触发 Emby/Jellyfin 元数据刷新，完全对齐参考插件 __refresh_emby_library_by_id。
+        仅在 nfo_copy_enabled 开启时调用。
+
+        - 填写了 _emby_library_id：仅刷新该指定库
+        - 未填写：通过 VirtualFolders 获取所有顶级媒体库 ItemId，逐个刷新
+
+        关键参数（对齐参考插件）：
+          ReplaceAllMetadata=true  → 强制用 NFO 覆盖现有元数据，确保刮削内容生效
+          ReplaceAllImages=false   → 不强制替换图片，保留已有封面
+          MetadataRefreshMode=FullRefresh
         """
         if not self._nfo_copy_enabled:
             return
@@ -876,35 +910,63 @@ class ShortPlayMonitorWithCMS(_PluginBase):
 
             for server_name, server in servers.items():
                 try:
-                    instance = server.instance
-                    config = server.config.config
-                    host = config.get("host", "")
-                    apikey = config.get("apikey", "")
-                    if not host or not apikey:
+                    conn = self.__get_emby_conn(server)
+                    if not conn:
+                        logger.warning(f"[元数据刷新] {server_name} 配置不完整，跳过")
                         continue
-                    if not host.endswith("/"):
-                        host += "/"
-                    if not host.startswith("http"):
-                        host = "http://" + host
+                    host, apikey, _ = conn
+                    server_type = str(type(server.instance).__name__).lower()
 
-                    server_type = str(type(instance).__name__).lower()
-                    if "emby" in server_type or "jellyfin" in server_type:
+                    if "emby" not in server_type and "jellyfin" not in server_type:
+                        logger.debug(f"[元数据刷新] {server_name} 非Emby/Jellyfin，跳过元数据刷新")
+                        continue
+
+                    # 确定要刷新的 item_id 列表
+                    item_ids = []
+                    if self._emby_library_id:
+                        item_ids = [self._emby_library_id]
+                        logger.info(f"[元数据刷新] {server_name} 刷新指定库 ItemId={self._emby_library_id}")
+                    else:
+                        # 通过 VirtualFolders 获取所有顶级媒体库 ItemId
+                        libs_url = f"{host}emby/Library/VirtualFolders?api_key={apikey}"
+                        try:
+                            with RequestUtils().get_res(libs_url) as res:
+                                if res and res.status_code == 200:
+                                    for lib in res.json():
+                                        lib_id = lib.get("ItemId") or lib.get("Id")
+                                        if lib_id:
+                                            item_ids.append(lib_id)
+                                    logger.info(f"[元数据刷新] {server_name} 获取到 {len(item_ids)} 个媒体库")
+                                else:
+                                    logger.error(f"[元数据刷新] {server_name} 获取媒体库列表失败，跳过")
+                                    continue
+                        except Exception as e:
+                            logger.error(f"[元数据刷新] {server_name} 获取媒体库列表异常：{e}")
+                            continue
+
+                    # 逐个触发元数据刷新，完全对齐参考插件 __refresh_emby_library_by_id
+                    for item_id in item_ids:
                         req_url = (
-                            f"{host}emby/Items/Refresh"
+                            f"{host}emby/Items/{item_id}/Refresh"
                             f"?Recursive=true"
                             f"&MetadataRefreshMode=FullRefresh"
                             f"&ImageRefreshMode=FullRefresh"
+                            f"&ReplaceAllMetadata=true"
+                            f"&ReplaceAllImages=false"
                             f"&api_key={apikey}"
                         )
-                        ret = RequestUtils().post_res(req_url)
-                        if ret:
-                            logger.info(f"[元数据刷新] {server_name} 元数据刷新已触发")
-                        else:
-                            logger.error(f"[元数据刷新] {server_name} 元数据刷新触发失败")
-                    else:
-                        logger.debug(f"[元数据刷新] {server_name} 非Emby/Jellyfin，跳过元数据刷新")
+                        try:
+                            with RequestUtils().post_res(req_url) as ret:
+                                if ret:
+                                    logger.info(f"[元数据刷新] {server_name} ItemId={item_id} 刷新已触发")
+                                else:
+                                    logger.error(f"[元数据刷新] {server_name} ItemId={item_id} 刷新失败，无法连接Emby")
+                        except Exception as e:
+                            logger.error(f"[元数据刷新] {server_name} ItemId={item_id} 刷新异常：{e}")
+
                 except Exception as e:
-                    logger.error(f"[元数据刷新] {server_name} 异常：{e}", exc_info=True)
+                    logger.error(f"[元数据刷新] {server_name} 处理异常：{e}", exc_info=True)
+
         except Exception as e:
             logger.error(f"[元数据刷新] 获取媒体服务器异常：{e}", exc_info=True)
 
@@ -1466,6 +1528,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "nfo_copy_enabled": self._nfo_copy_enabled,
             "nfo_copy_dest": self._nfo_copy_dest,
             "media_scan_enabled": self._media_scan_enabled,
+            "emby_library_id": self._emby_library_id,
         })
 
     def get_state(self) -> bool:
@@ -1849,14 +1912,28 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 9},
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'emby_library_id',
+                                            'label': 'Emby媒体库ItemId（留空则全库）',
+                                            'placeholder': '留空则扫描/刷新全部媒体库，填写后仅处理指定库'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 5},
                                 'content': [
                                     {
                                         'component': 'VAlert',
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '开启后，在封面图复制完成后（未开封面复制则在CMS增量完成后）自动触发 MP 中已配置的媒体服务器（Emby/Jellyfin/Plex）执行全库扫描。'
+                                            'text': '开启后自动触发 Emby/Jellyfin/Plex 扫描媒体库，并在开启NFO复制时触发元数据刷新。ItemId 可在 Emby 控制台媒体库设置页面的 URL 中找到。'
                                         }
                                     }
                                 ]
@@ -2085,6 +2162,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
             "nfo_copy_enabled": False,
             "nfo_copy_dest": "",
             "media_scan_enabled": False,
+            "emby_library_id": "",
             "cms_enabled": False,
             "cms_notify_type": "lift_sync",
             "cms_api_token": "cloud_media_sync",
