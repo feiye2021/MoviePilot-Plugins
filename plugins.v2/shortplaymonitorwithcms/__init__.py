@@ -69,7 +69,7 @@ class ShortPlayMonitorWithCMS(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/amule-1.png" 
     # 插件版本
-    plugin_version = "1.1.6"
+    plugin_version = "1.1.7"
     # 插件作者
     plugin_author = "feiye"
     # 作者主页
@@ -448,8 +448,9 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                 # 媒体库扫描
                 self.__scan_mediaserver()
                 # 如果开启了NFO复制，媒体库扫描后立即刷新元数据
+                # 强制重新刮削场景直接走整库/指定库模式（不按剧名精准刷新）
                 if self._nfo_copy_enabled:
-                    self.__refresh_metadata()
+                    self.__refresh_metadata(titles=None)
                 logger.info("[重新刮削] 封面/NFO复制、媒体库扫描和元数据刷新已完成")
             threading.Thread(target=_re_scrape_after, daemon=True).start()
         else:
@@ -887,18 +888,20 @@ class ShortPlayMonitorWithCMS(_PluginBase):
         except Exception as e:
             logger.error(f"[媒体库扫描] 获取媒体服务器异常：{e}", exc_info=True)
 
-    def __refresh_metadata(self):
+    def __refresh_metadata(self, titles: list = None):
         """
-        触发 Emby/Jellyfin 元数据刷新，完全对齐参考插件 __refresh_emby_library_by_id。
+        触发 Emby/Jellyfin 元数据刷新，对齐参考插件 __refresh_emby_library_by_id。
         仅在 nfo_copy_enabled 开启时调用。
 
-        - 填写了 _emby_library_id：仅刷新该指定库
-        - 未填写：通过 VirtualFolders 获取所有顶级媒体库 ItemId，逐个刷新
+        参数 titles：本次处理的剧名列表。
+        - 填写了 _emby_library_id 且有 titles：
+            在 Emby 中按剧名搜索对应 SeriesId，仅刷新这些剧集，精准高效。
+        - 填写了 _emby_library_id 但无 titles：
+            直接刷新该指定库（整库）。
+        - 未填写 _emby_library_id：
+            通过 VirtualFolders 获取所有顶级媒体库，逐个整库刷新。
 
-        关键参数（对齐参考插件）：
-          ReplaceAllMetadata=true  → 强制用 NFO 覆盖现有元数据，确保刮削内容生效
-          ReplaceAllImages=false   → 不强制替换图片，保留已有封面
-          MetadataRefreshMode=FullRefresh
+        关键参数：ReplaceAllMetadata=true 强制用 NFO 覆盖现有元数据。
         """
         if not self._nfo_copy_enabled:
             return
@@ -918,57 +921,109 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                     server_type = str(type(server.instance).__name__).lower()
 
                     if "emby" not in server_type and "jellyfin" not in server_type:
-                        logger.debug(f"[元数据刷新] {server_name} 非Emby/Jellyfin，跳过元数据刷新")
+                        logger.debug(f"[元数据刷新] {server_name} 非Emby/Jellyfin，跳过")
                         continue
 
-                    # 确定要刷新的 item_id 列表
-                    item_ids = []
-                    if self._emby_library_id:
-                        item_ids = [self._emby_library_id]
-                        logger.info(f"[元数据刷新] {server_name} 刷新指定库 ItemId={self._emby_library_id}")
+                    if self._emby_library_id and titles:
+                        # ── 精准模式：按剧名搜索 SeriesId，逐部刷新 ──────────
+                        logger.info(f"[元数据刷新] {server_name} 精准刷新模式，共 {len(titles)} 部剧")
+                        for title in titles:
+                            series_id = self.__get_emby_series_id(host, apikey, title)
+                            if series_id:
+                                self.__refresh_series_metadata(host, apikey, series_id, title)
+                            else:
+                                logger.warning(f"[元数据刷新] 未在Emby找到剧集「{title}」，跳过")
                     else:
-                        # 通过 VirtualFolders 获取所有顶级媒体库 ItemId
-                        libs_url = f"{host}emby/Library/VirtualFolders?api_key={apikey}"
-                        try:
-                            with RequestUtils().get_res(libs_url) as res:
-                                if res and res.status_code == 200:
-                                    for lib in res.json():
-                                        lib_id = lib.get("ItemId") or lib.get("Id")
-                                        if lib_id:
-                                            item_ids.append(lib_id)
-                                    logger.info(f"[元数据刷新] {server_name} 获取到 {len(item_ids)} 个媒体库")
-                                else:
-                                    logger.error(f"[元数据刷新] {server_name} 获取媒体库列表失败，跳过")
-                                    continue
-                        except Exception as e:
-                            logger.error(f"[元数据刷新] {server_name} 获取媒体库列表异常：{e}")
-                            continue
+                        # ── 整库模式：刷新指定库或全部媒体库 ────────────────
+                        item_ids = []
+                        if self._emby_library_id:
+                            item_ids = [self._emby_library_id]
+                            logger.info(f"[元数据刷新] {server_name} 刷新指定库 ItemId={self._emby_library_id}")
+                        else:
+                            libs_url = f"{host}emby/Library/VirtualFolders?api_key={apikey}"
+                            try:
+                                with RequestUtils().get_res(libs_url) as res:
+                                    if res and res.status_code == 200:
+                                        for lib in res.json():
+                                            lib_id = lib.get("ItemId") or lib.get("Id")
+                                            if lib_id:
+                                                item_ids.append(lib_id)
+                                        logger.info(f"[元数据刷新] {server_name} 获取到 {len(item_ids)} 个媒体库")
+                                    else:
+                                        logger.error(f"[元数据刷新] {server_name} 获取媒体库列表失败，跳过")
+                                        continue
+                            except Exception as e:
+                                logger.error(f"[元数据刷新] {server_name} 获取媒体库列表异常：{e}")
+                                continue
 
-                    # 逐个触发元数据刷新，完全对齐参考插件 __refresh_emby_library_by_id
-                    for item_id in item_ids:
-                        req_url = (
-                            f"{host}emby/Items/{item_id}/Refresh"
-                            f"?Recursive=true"
-                            f"&MetadataRefreshMode=FullRefresh"
-                            f"&ImageRefreshMode=FullRefresh"
-                            f"&ReplaceAllMetadata=true"
-                            f"&ReplaceAllImages=false"
-                            f"&api_key={apikey}"
-                        )
-                        try:
-                            with RequestUtils().post_res(req_url) as ret:
-                                if ret:
-                                    logger.info(f"[元数据刷新] {server_name} ItemId={item_id} 刷新已触发")
-                                else:
-                                    logger.error(f"[元数据刷新] {server_name} ItemId={item_id} 刷新失败，无法连接Emby")
-                        except Exception as e:
-                            logger.error(f"[元数据刷新] {server_name} ItemId={item_id} 刷新异常：{e}")
+                        for item_id in item_ids:
+                            self.__refresh_series_metadata(host, apikey, item_id,
+                                                           f"库_{item_id}")
 
                 except Exception as e:
                     logger.error(f"[元数据刷新] {server_name} 处理异常：{e}", exc_info=True)
 
         except Exception as e:
             logger.error(f"[元数据刷新] 获取媒体服务器异常：{e}", exc_info=True)
+
+    def __get_emby_series_id(self, host: str, apikey: str, title: str) -> str:
+        """
+        在 Emby 中按剧名搜索 Series ItemId，对齐参考插件 __get_emby_series_id_by_name。
+        返回找到的第一个匹配 ItemId，未找到返回空字符串。
+        """
+        req_url = (
+            f"{host}emby/Items"
+            f"?IncludeItemTypes=Series"
+            f"&Fields=ProductionYear"
+            f"&StartIndex=0"
+            f"&Recursive=true"
+            f"&SearchTerm={title}"
+            f"&Limit=10"
+            f"&IncludeSearchTypes=false"
+            f"&api_key={apikey}"
+        )
+        try:
+            with RequestUtils().get_res(req_url) as res:
+                if res and res.status_code == 200:
+                    items = res.json().get("Items", [])
+                    for item in items:
+                        if item.get("Name") == title:
+                            series_id = item.get("Id")
+                            logger.debug(f"[Emby搜索] 找到剧集「{title}」ItemId={series_id}")
+                            return series_id
+                    # 名字完全匹配不到，取第一条
+                    if items:
+                        series_id = items[0].get("Id", "")
+                        logger.debug(f"[Emby搜索] 近似匹配剧集「{title}」ItemId={series_id}")
+                        return series_id
+                else:
+                    logger.error(f"[Emby搜索] 搜索「{title}」失败")
+        except Exception as e:
+            logger.error(f"[Emby搜索] 搜索「{title}」异常：{e}")
+        return ""
+
+    def __refresh_series_metadata(self, host: str, apikey: str, series_id: str, title: str):
+        """
+        针对单部剧集触发元数据刷新（对齐参考插件 __refresh_emby_library_by_id）。
+        ReplaceAllMetadata=true 确保 NFO 内容覆盖 Emby 现有数据。
+        """
+        req_url = (
+            f"{host}emby/Items/{series_id}/Refresh"
+            f"?Recursive=true"
+            f"&MetadataRefreshMode=FullRefresh"
+            f"&ImageRefreshMode=FullRefresh"
+            f"&ReplaceAllMetadata=true"
+            f"&ReplaceAllImages=false"
+            f"&api_key={apikey}"
+        )
+        try:
+            with RequestUtils().post_res(req_url) as ret:
+                if ret:
+                    logger.info(f"[元数据刷新] 剧集「{title}」(ItemId={series_id}) 元数据刷新已触发")
+                else:
+                    logger.error(f"[元数据刷新] 剧集「{title}」(ItemId={series_id}) 刷新失败，无法连接Emby")
+        except Exception as e:
+            logger.error(f"[元数据刷新] 剧集「{title}」刷新异常：{e}")
 
     def __copy_poster_to_dest(self, title: str, target_dir: str):
         """
@@ -1042,36 +1097,48 @@ class ShortPlayMonitorWithCMS(_PluginBase):
                     logger.info(f"[CMS] 等待60秒后执行封面复制和入库通知，涉及剧集：{list(pending_snapshot.keys())}")
 
                     def _do_after_cms_delay(pending_data: dict):
-                        logger.info(f"[CMS延时] 开始执行封面复制和入库通知")
+                        logger.info(f"[CMS延时] 开始执行封面/NFO复制、媒体库扫描和元数据刷新")
+
+                        # 1. 封面图复制 + NFO复制（如已开启）
                         for t, p in pending_data.items():
                             try:
-                                # 1. 封面图复制到指定目录（如已开启）
                                 t_dir = p.get("target_dir", "")
                                 if t_dir:
                                     self.__copy_poster_to_dest(title=t, target_dir=t_dir)
-                                    # 封面复制完成后，同步复制 NFO（如已开启）
                                     self.__copy_nfo_to_dest(title=t, target_dir=t_dir)
-                                # 2. 触发 MP 入库通知
-                                if self._notify:
+                            except Exception as e:
+                                logger.error(f"[CMS延时] 封面/NFO复制「{t}」异常：{e}", exc_info=True)
+
+                        # 2. 媒体库扫描（如已开启）
+                        #    开了封面复制：等待3分钟再扫描
+                        if self._media_scan_enabled:
+                            if self._poster_copy_enabled:
+                                logger.info("[媒体库扫描] 封面复制完成，等待3分钟后触发媒体库扫描...")
+                                time.sleep(180)
+                            self.__scan_mediaserver()
+
+                        # 3. 元数据刷新（如已开启NFO复制）
+                        #    填写了ItemId时按剧名精准刷新，否则整库刷新
+                        if self._nfo_copy_enabled:
+                            titles = list(pending_data.keys())
+                            self.__refresh_metadata(titles=titles)
+
+                        # 4. 元数据刷新完成后等待1分钟，再触发 MP 入库通知
+                        #    确保 Emby 已处理完元数据，通知时序最末
+                        if self._notify:
+                            if self._nfo_copy_enabled:
+                                logger.info("[通知] 等待1分钟后发送入库通知...")
+                                time.sleep(60)
+                            for t, p in pending_data.items():
+                                try:
                                     media_files = p.get("files", [])
                                     self._medias[t] = {
                                         "files": media_files,
                                         "time": datetime.datetime.now()
                                     }
                                     logger.info(f"[通知] 剧集「{t}」共{len(media_files)}集，已加入通知队列")
-                            except Exception as e:
-                                logger.error(f"[CMS延时] 处理剧集「{t}」异常：{e}", exc_info=True)
-                        # 3. 所有剧集处理完后触发媒体库扫描，NFO复制后再刷新元数据
-                        #    未开封面复制：CMS完成后扫描
-                        #    开了封面复制：封面复制完成后等待3分钟再扫描
-                        if self._media_scan_enabled:
-                            if self._poster_copy_enabled:
-                                logger.info("[媒体库扫描] 封面复制完成，等待3分钟后触发媒体库扫描...")
-                                time.sleep(180)
-                            self.__scan_mediaserver()
-                        # 4. 如果开启了NFO复制，媒体库扫描后立即刷新元数据
-                        if self._nfo_copy_enabled:
-                            self.__refresh_metadata()
+                                except Exception as e:
+                                    logger.error(f"[CMS延时] 通知「{t}」异常：{e}", exc_info=True)
 
                     import threading
                     threading.Timer(60.0, _do_after_cms_delay, args=(pending_snapshot,)).start()
