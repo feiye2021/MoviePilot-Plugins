@@ -43,7 +43,7 @@
         "name": "NodeSeek论坛签到",
         "description": "自动完成NodeSeek论坛每日签到，支持随机奖励和自动重试功能",
         "labels": "签到,NodeSeek,论坛",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "icon": "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/nodeseeksign.png",
         "author": "feiye",
         "level": 2,
