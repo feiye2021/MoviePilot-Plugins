@@ -48,6 +48,7 @@
         "author": "feiye",
         "level": 2,
         "history": {
+            "v1.0.1": "1. 修复bug。",
             "v1.0.0": "新增插件上传"
         }
     }

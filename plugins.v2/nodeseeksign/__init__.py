@@ -36,11 +36,11 @@ except ImportError:
     HAS_BROTLI = False
 
 
-class nodeseeksign(_PluginBase):
+class NodeseekSign(_PluginBase):
     plugin_name = "NodeSeek论坛签到"
     plugin_desc = "NodeSeek论坛每日签到，支持随机奖励和自动重试功能"
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/nodeseeksign.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "feiye"
     author_url = "https://github.com/feiye2021/MoviePilot-Plugins"
     plugin_config_prefix = "nodeseeksign_"
