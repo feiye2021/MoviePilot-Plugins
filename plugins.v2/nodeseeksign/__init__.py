@@ -40,17 +40,14 @@ class NodeseekSign(_PluginBase):
     plugin_name = "NodeSeek论坛签到"
     plugin_desc = "NodeSeek论坛每日签到，支持随机奖励和自动重试功能"
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/nodeseeksign.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "feiye"
     author_url = "https://github.com/feiye2021/MoviePilot-Plugins"
     plugin_config_prefix = "nodeseeksign_"
     plugin_order = 1
     auth_level = 2
-    # 插件依赖：MoviePilot 框架读取此字段，在插件加载时自动 pip install
-    # 与根目录 requirements.txt 等价，二者选其一即可，此处已完全替代外部文件
     plugin_requires = "curl_cffi>=0.13.0,<0.15.0\ncloudscraper>=1.2.71,<2.0.0\nbrotli>=1.0.9"
 
-    # 私有属性
     _enabled = False
     _cookie = None
     _notify = False
@@ -107,7 +104,6 @@ class NodeseekSign(_PluginBase):
                     f"member_id={self._member_id or '未设置'}, clear_history={self._clear_history}"
                 )
 
-                # 初始化 cloudscraper（CF JS challenge 求解备用）
                 if HAS_CLOUDSCRAPER:
                     try:
                         self._scraper = cloudscraper.create_scraper(browser="chrome")
@@ -146,7 +142,6 @@ class NodeseekSign(_PluginBase):
             logger.error(f"nodeseeksign初始化错误: {str(e)}", exc_info=True)
 
     def __save_config(self, clear_history: bool = False):
-        """统一保存配置"""
         self.update_config({
             "onlyonce":      False,
             "enabled":       self._enabled,
@@ -168,7 +163,6 @@ class NodeseekSign(_PluginBase):
     # ------------------------------------------------------------------ #
 
     def _build_headers(self, extra: dict = None) -> dict:
-        """构建标准浏览器请求头"""
         headers = {
             'Accept':             '*/*',
             'Accept-Encoding':    'gzip, deflate, br, zstd',
@@ -193,10 +187,6 @@ class NodeseekSign(_PluginBase):
         return headers
 
     def _is_cf_blocked(self, resp) -> bool:
-        """
-        判断响应是否被 Cloudflare 拦截。
-        CF拦截特征：状态码 403/503 且 Content-Type 为 text/html。
-        """
         status = getattr(resp, 'status_code', 0)
         ct = (resp.headers.get('Content-Type') or resp.headers.get('content-type') or '').lower()
         if status in (403, 503) and 'text/html' in ct:
@@ -207,7 +197,7 @@ class NodeseekSign(_PluginBase):
     def _smart_post(self, url: str, headers: dict = None, data=None, timeout: int = 30):
         """
         POST 请求，优先级：curl_cffi > cloudscraper > requests
-        全程启用 SSL 验证（verify=True）。
+        全程启用 SSL 验证（verify=True）
         """
         last_error = None
 
@@ -247,8 +237,8 @@ class NodeseekSign(_PluginBase):
 
     def _smart_get(self, url: str, headers: dict = None, timeout: int = 30):
         """
-        GET 请求，优先级同 _smart_post。
-        全程启用 SSL 验证（verify=True）。
+        GET 请求，优先级同 _smart_post
+        全程启用 SSL 验证（verify=True）
         """
         last_error = None
 
@@ -287,11 +277,6 @@ class NodeseekSign(_PluginBase):
             raise e
 
     def _decode_response_text(self, resp) -> str:
-        """
-        统一解码响应体，自动处理 Brotli(br) 压缩。
-        curl_cffi / cloudscraper 通常自动解压；requests 在某些环境下不处理 br，
-        此方法作为兜底保障，确保始终返回可用的文本内容。
-        """
         encoding = (resp.headers.get('content-encoding') or '').lower()
         if encoding == 'br':
             if HAS_BROTLI:
@@ -308,7 +293,6 @@ class NodeseekSign(_PluginBase):
     # ------------------------------------------------------------------ #
 
     def sign(self):
-        """执行 NodeSeek 签到"""
         logger.info("============= 开始NodeSeek签到 =============")
         sign_dict = None
         try:
@@ -382,7 +366,6 @@ class NodeseekSign(_PluginBase):
                     "message": result.get("message", "")
                 }
 
-                # 兜底：通过签到记录日期确认是否已签到
                 try:
                     ar = attendance_record or {}
                     if ar.get("created_at"):
@@ -407,7 +390,6 @@ class NodeseekSign(_PluginBase):
                 except Exception as e:
                     logger.warning(f"获取收益统计失败: {e}")
 
-                # 安排重试
                 max_retries = int(self._max_retries) if self._max_retries else 0
                 if max_retries and self._retry_count < max_retries:
                     self._retry_count += 1
@@ -474,7 +456,6 @@ class NodeseekSign(_PluginBase):
             return sign_dict
 
     def _run_api_sign(self) -> dict:
-        """调用 NodeSeek 签到 API"""
         try:
             result = {"success": False, "signed": False, "already_signed": False, "message": ""}
             random_param = "true" if self._random_choice else "false"
@@ -508,7 +489,7 @@ class NodeseekSign(_PluginBase):
                     result.update({"message": msg or f"未知响应: {response.status_code}"})
 
             except Exception:
-                text = response.text or ""
+                text = self._decode_response_text(response)
                 logger.warning(f"非JSON签到响应: {text[:400]}")
                 if any(k in text for k in ["鸡腿", "签到成功", "签到完成"]):
                     result.update({"success": True, "signed": True, "message": text[:80]})
@@ -531,7 +512,6 @@ class NodeseekSign(_PluginBase):
     # ------------------------------------------------------------------ #
 
     def _wait_random_interval(self):
-        """请求前随机延迟，模拟人类行为"""
         try:
             mn = float(self._min_delay or 5)
             mx = float(self._max_delay or 12)
@@ -543,7 +523,6 @@ class NodeseekSign(_PluginBase):
             pass
 
     def _fetch_user_info(self, member_id: str) -> dict:
-        """拉取用户信息（可选）"""
         if not member_id:
             return {}
         url = f"https://www.nodeseek.com/api/account/getInfo/{member_id}?readme=1"
@@ -562,7 +541,6 @@ class NodeseekSign(_PluginBase):
             return {}
 
     def _fetch_attendance_record(self) -> dict:
-        """拉取签到记录，获取奖励和排名"""
         try:
             url = "https://www.nodeseek.com/api/attendance/board?page=1"
             headers = self._build_headers({'Cookie': self._cookie})
@@ -572,7 +550,7 @@ class NodeseekSign(_PluginBase):
             try:
                 data = resp.json()
             except Exception:
-                logger.warning(f"签到记录非JSON响应: {(resp.text or '')[:400]}")
+                logger.warning(f"签到记录非JSON响应: {self._decode_response_text(resp)[:400]}")
                 return self._get_cached_attendance_if_today()
 
             record = data.get("record", {})
@@ -592,7 +570,6 @@ class NodeseekSign(_PluginBase):
             return {}
 
     def _get_cached_attendance_if_today(self) -> dict:
-        """返回今日有效的缓存签到记录"""
         try:
             cached = self.get_data('last_attendance_record') or {}
             if cached and cached.get('created_at'):
@@ -607,7 +584,6 @@ class NodeseekSign(_PluginBase):
         return {}
 
     def _save_sign_history(self, sign_data: dict):
-        """保存签到历史记录"""
         try:
             history = self.get_data('sign_history') or []
             if "date" not in sign_data:
@@ -632,7 +608,6 @@ class NodeseekSign(_PluginBase):
             logger.error(f"保存签到历史记录失败: {e}", exc_info=True)
 
     def clear_sign_history(self):
-        """清除所有签到历史数据"""
         try:
             for key in ("sign_history", "last_sign_date", "last_user_info", "last_attendance_record"):
                 self.save_data(key=key, value="" if key != "sign_history" else [])
@@ -666,7 +641,6 @@ class NodeseekSign(_PluginBase):
         user_info: dict = None,
         attendance_record: dict = None,
     ):
-        """发送签到通知"""
         if not self._notify:
             return
 
@@ -780,7 +754,6 @@ class NodeseekSign(_PluginBase):
                 pass
 
         if not signin_records:
-            # 降级：使用本地历史
             try:
                 history = self.get_data('sign_history') or []
                 success_statuses = {"签到成功", "已签到", "签到成功（时间验证）", "已签到（从记录确认）", "已签到（记录确认）"}
@@ -936,7 +909,6 @@ class NodeseekSign(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        """构建插件详情页面"""
         user_info = self.get_data('last_user_info') or {}
         historys  = self.get_data('sign_history') or []
 
@@ -982,7 +954,6 @@ class NodeseekSign(_PluginBase):
                 ]
             })
 
-        # 用户信息卡片
         user_info_card = []
         if user_info:
             mid       = str(user_info.get('member_id') or self._member_id or '').strip()
@@ -1021,7 +992,6 @@ class NodeseekSign(_PluginBase):
                 ]
             }]
 
-        # 收益统计卡片
         stats_card = []
         stats = self.get_data('last_signin_stats') or {}
         if stats:
@@ -1060,7 +1030,6 @@ class NodeseekSign(_PluginBase):
         }]
 
     def stop_service(self):
-        """退出插件，停止定时任务"""
         try:
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
