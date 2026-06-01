@@ -46,8 +46,8 @@ def _ensure_dependencies() -> list:
 
     # (pip安装名, import名, 版本约束)
     deps = [
-        ("curl_cffi",    "curl_cffi",    ">=0.13.0,<0.15.0"),
-        ("cloudscraper", "cloudscraper", ">=1.2.71,<2.0.0"),
+        ("curl_cffi",    "curl_cffi",    ">=0.7.0"),
+        ("cloudscraper", "cloudscraper", ">=1.2.71"),
         ("brotli",       "brotli",       ">=1.0.9"),
     ]
     installed = []
@@ -77,13 +77,13 @@ class NodeseekSign(_PluginBase):
     plugin_name = "NodeSeek论坛签到"
     plugin_desc = "NodeSeek论坛每日签到，支持随机奖励和自动重试功能"
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/nodeseeksign.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "feiye"
     author_url = "https://github.com/feiye2021/MoviePilot-Plugins"
     plugin_config_prefix = "nodeseeksign_"
     plugin_order = 1
     auth_level = 2
-    plugin_requires = "curl_cffi>=0.13.0,<0.15.0\ncloudscraper>=1.2.71,<2.0.0\nbrotli>=1.0.9"
+    plugin_requires = "curl_cffi>=0.7.0\ncloudscraper>=1.2.71\nbrotli>=1.0.9"
 
     _enabled = False
     _cookie = None
@@ -270,21 +270,29 @@ class NodeseekSign(_PluginBase):
         """
         POST 请求，优先级：curl_cffi > cloudscraper > requests
         全程启用 SSL 验证（verify=True）
+        每次 CF 拦截后随机等待 2-5 秒再降级，避免连续请求触发更严格验证
         """
         last_error = None
 
+        # 可轮换的 Chrome 指纹列表，随机选择增加通过率
+        _fingerprints = ["chrome136", "chrome124", "chrome110", "chrome107"]
+
         # 1) curl_cffi —— Chrome TLS 指纹，最强 CF 绕过
         if HAS_CURL_CFFI:
-            try:
-                logger.info("curl_cffi POST (Chrome-120)")
-                session = curl_requests.Session(impersonate="chrome120")
-                resp = session.post(url, headers=headers, data=data, timeout=timeout, verify=True)
-                if not self._is_cf_blocked(resp):
-                    return resp
-                logger.info("curl_cffi POST 被CF拦截，降级")
-            except Exception as e:
-                last_error = e
-                logger.warning(f"curl_cffi POST 失败: {e}")
+            for fp in _fingerprints:
+                try:
+                    logger.info(f"curl_cffi POST ({fp})")
+                    session = curl_requests.Session(impersonate=fp)
+                    resp = session.post(url, headers=headers, data=data, timeout=timeout, verify=True)
+                    if not self._is_cf_blocked(resp):
+                        return resp
+                    logger.info(f"curl_cffi POST ({fp}) 被CF拦截，尝试下一指纹")
+                    time.sleep(random.uniform(1, 3))
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"curl_cffi POST ({fp}) 失败: {e}")
+            logger.info("curl_cffi 所有指纹均被拦截，降级到 cloudscraper")
+            time.sleep(random.uniform(2, 5))
 
         # 2) cloudscraper —— JS challenge 求解
         if HAS_CLOUDSCRAPER and self._scraper:
@@ -293,7 +301,8 @@ class NodeseekSign(_PluginBase):
                 resp = self._scraper.post(url, headers=headers, data=data, timeout=timeout, verify=True)
                 if not self._is_cf_blocked(resp):
                     return resp
-                logger.info("cloudscraper POST 被CF拦截，降级")
+                logger.info("cloudscraper POST 被CF拦截，降级到 requests")
+                time.sleep(random.uniform(2, 5))
             except Exception as e:
                 last_error = e
                 logger.warning(f"cloudscraper POST 失败: {e}")
@@ -311,21 +320,29 @@ class NodeseekSign(_PluginBase):
         """
         GET 请求，优先级同 _smart_post
         全程启用 SSL 验证（verify=True）
+        每次 CF 拦截后随机等待再降级
         """
         last_error = None
 
+        # 可轮换的 Chrome 指纹列表
+        _fingerprints = ["chrome136", "chrome124", "chrome110", "chrome107"]
+
         # 1) curl_cffi
         if HAS_CURL_CFFI:
-            try:
-                logger.info(f"curl_cffi GET (Chrome-120): {url}")
-                session = curl_requests.Session(impersonate="chrome120")
-                resp = session.get(url, headers=headers, timeout=timeout, verify=True)
-                if not self._is_cf_blocked(resp):
-                    return resp
-                logger.info("curl_cffi GET 被CF拦截，降级")
-            except Exception as e:
-                last_error = e
-                logger.warning(f"curl_cffi GET 失败: {e}")
+            for fp in _fingerprints:
+                try:
+                    logger.info(f"curl_cffi GET ({fp}): {url}")
+                    session = curl_requests.Session(impersonate=fp)
+                    resp = session.get(url, headers=headers, timeout=timeout, verify=True)
+                    if not self._is_cf_blocked(resp):
+                        return resp
+                    logger.info(f"curl_cffi GET ({fp}) 被CF拦截，尝试下一指纹")
+                    time.sleep(random.uniform(1, 3))
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"curl_cffi GET ({fp}) 失败: {e}")
+            logger.info("curl_cffi 所有指纹均被拦截，降级到 cloudscraper")
+            time.sleep(random.uniform(2, 5))
 
         # 2) cloudscraper
         if HAS_CLOUDSCRAPER and self._scraper:
@@ -334,7 +351,8 @@ class NodeseekSign(_PluginBase):
                 resp = self._scraper.get(url, headers=headers, timeout=timeout, verify=True)
                 if not self._is_cf_blocked(resp):
                     return resp
-                logger.info("cloudscraper GET 被CF拦截，降级")
+                logger.info("cloudscraper GET 被CF拦截，降级到 requests")
+                time.sleep(random.uniform(2, 5))
             except Exception as e:
                 last_error = e
                 logger.warning(f"cloudscraper GET 失败: {e}")
