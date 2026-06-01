@@ -36,11 +36,48 @@ except ImportError:
     HAS_BROTLI = False
 
 
+def _ensure_dependencies() -> list:
+    """
+    检查并自动安装缺失的依赖库。
+    返回成功安装的库名列表，调用方据此重新 import 并更新全局标志。
+    """
+    import subprocess
+    import sys
+
+    # (pip安装名, import名, 版本约束)
+    deps = [
+        ("curl_cffi",    "curl_cffi",    ">=0.13.0,<0.15.0"),
+        ("cloudscraper", "cloudscraper", ">=1.2.71,<2.0.0"),
+        ("brotli",       "brotli",       ">=1.0.9"),
+    ]
+    installed = []
+    for pip_name, import_name, version in deps:
+        try:
+            __import__(import_name)
+        except ImportError:
+            pkg = f"{pip_name}{version}"
+            try:
+                logger.info(f"依赖 {pip_name} 未安装，正在自动安装 {pkg} ...")
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", pkg,
+                     "--quiet", "--no-warn-script-location"],
+                    capture_output=True, text=True, timeout=120
+                )
+                if result.returncode == 0:
+                    logger.info(f"✅ {pip_name} 安装成功")
+                    installed.append(import_name)
+                else:
+                    logger.error(f"❌ {pip_name} 安装失败: {result.stderr.strip()[:200]}")
+            except Exception as e:
+                logger.error(f"❌ {pip_name} 安装异常: {e}")
+    return installed
+
+
 class NodeseekSign(_PluginBase):
     plugin_name = "NodeSeek论坛签到"
     plugin_desc = "NodeSeek论坛每日签到，支持随机奖励和自动重试功能"
     plugin_icon = "https://raw.githubusercontent.com/feiye2021/MoviePilot-Plugins/main/icons/nodeseeksign.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "feiye"
     author_url = "https://github.com/feiye2021/MoviePilot-Plugins"
     plugin_config_prefix = "nodeseeksign_"
@@ -71,6 +108,41 @@ class NodeseekSign(_PluginBase):
     def init_plugin(self, config: dict = None):
         self.stop_service()
         logger.info("============= nodeseeksign 初始化 =============")
+
+        # ── 自动安装缺失依赖 ──────────────────────────────────────────
+        try:
+            newly_installed = _ensure_dependencies()
+            if newly_installed:
+                global HAS_CURL_CFFI, HAS_CLOUDSCRAPER, HAS_BROTLI
+                global curl_requests, cloudscraper, brotli
+                if "curl_cffi" in newly_installed:
+                    try:
+                        from curl_cffi import requests as _cr
+                        curl_requests = _cr
+                        HAS_CURL_CFFI = True
+                        logger.info("curl_cffi 重新加载成功，本次签到即可生效")
+                    except Exception as e:
+                        logger.warning(f"curl_cffi 重新加载失败: {e}")
+                if "cloudscraper" in newly_installed:
+                    try:
+                        import cloudscraper as _cs
+                        cloudscraper = _cs
+                        HAS_CLOUDSCRAPER = True
+                        logger.info("cloudscraper 重新加载成功，本次签到即可生效")
+                    except Exception as e:
+                        logger.warning(f"cloudscraper 重新加载失败: {e}")
+                if "brotli" in newly_installed:
+                    try:
+                        import brotli as _br
+                        brotli = _br
+                        HAS_BROTLI = True
+                        logger.info("brotli 重新加载成功")
+                    except Exception as e:
+                        logger.warning(f"brotli 重新加载失败: {e}")
+        except Exception as e:
+            logger.warning(f"依赖检查异常（不影响主流程）: {e}")
+        # ─────────────────────────────────────────────────────────────
+
         try:
             if config:
                 self._enabled = config.get("enabled")
